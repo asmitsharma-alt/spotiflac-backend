@@ -20,6 +20,7 @@ COPY . .
 # Ensure UTF-8 output encoding to prevent logging crashes
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONIOENCODING=utf-8
+ENV PYTHONUTF8=1
 
 ENV PORT=8000
 EXPOSE $PORT
