@@ -173,9 +173,11 @@ async def get_track_info(
         raise HTTPException(status_code=400, detail=f"Failed to fetch metadata: {str(e)}")
 
 
-def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool):
+def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool, meta=None):
     """Synchronous worker function executed in an asyncio thread pool."""
     import sys
+    import re
+    import urllib.request
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
@@ -185,25 +187,100 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
     qobuz_token = os.getenv("QOBUZ_TOKEN") or None
     tidal_api = os.getenv("TIDAL_CUSTOM_API") or None
 
-    # Multi-provider fallback chain:
-    # 1. YouTube Music (256k) & SoundCloud for high reliability & speed
-    # 2. Qobuz & Deezer (Lossless FLAC)
     services = ["youtube", "soundcloud", "qobuz", "deezer", "amazon"]
     if tidal_api:
         services.insert(0, "tidal")
 
-    SpotiFLAC(
-        url=url,
-        output_dir=output_dir,
-        services=services,
-        quality=quality,
-        embed_lyrics=embed_lyrics,
-        enrich_metadata=False,
-        qobuz_token=qobuz_token,
-        tidal_custom_api=tidal_api,
-        allow_fallback=True,
-        timeout_s=45,
-    )
+    # 1. Attempt SpotiFLAC multi-service extraction
+    try:
+        SpotiFLAC(
+            url=url,
+            output_dir=output_dir,
+            services=services,
+            quality=quality,
+            embed_lyrics=embed_lyrics,
+            enrich_metadata=False,
+            qobuz_token=qobuz_token,
+            tidal_custom_api=tidal_api,
+            allow_fallback=True,
+            timeout_s=60,
+        )
+    except Exception as e:
+        print(f"[SpotiFLAC] Run notice: {e}")
+
+    # Check if SpotiFLAC produced an audio file
+    downloaded = glob.glob(str(Path(output_dir) / "**/*.*"), recursive=True)
+    audio_files = [
+        f for f in downloaded
+        if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
+    ]
+    if audio_files:
+        return
+
+    # 2. Resilient Direct Stream Fallback via yt-dlp & mutagen
+    print("[Fallback] Audio provider mirrors failed or blocked. Executing direct high-quality stream fallback...")
+    try:
+        import yt_dlp
+        from mutagen.mp4 import MP4, MP4Cover
+
+        title = getattr(meta, "title", "Track") if meta else "Track"
+        artists = getattr(meta, "artists", "Artist") if meta else "Artist"
+        album = (getattr(meta, "album", "") if meta else "") or title
+        cover_url = getattr(meta, "cover_url", "") if meta else ""
+        year = str(getattr(meta, "release_date", ""))[:4] if meta and getattr(meta, "release_date", "") else ""
+
+        safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
+        safe_artist = re.sub(r'[\\/*?:"<>|]', "", artists)
+        base_filename = f"{safe_title} - {safe_artist}"
+        out_tmpl = os.path.join(output_dir, f"{base_filename}.%(ext)s")
+
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "outtmpl": out_tmpl,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "m4a",
+                    "preferredquality": "256",
+                }
+            ],
+            "default_search": "ytsearch1",
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([f"ytsearch1:{title} {artists} official audio"])
+
+        target_m4a = os.path.join(output_dir, f"{base_filename}.m4a")
+        if not os.path.exists(target_m4a):
+            candidates = glob.glob(os.path.join(output_dir, f"{base_filename}.*"))
+            if candidates:
+                target_m4a = candidates[0]
+
+        if os.path.exists(target_m4a) and target_m4a.endswith(".m4a"):
+            try:
+                audio = MP4(target_m4a)
+                audio["\xa9nam"] = [title]
+                audio["\xa9ART"] = [artists]
+                audio["\xa9alb"] = [album]
+                if year:
+                    audio["\xa9day"] = [year]
+                if cover_url:
+                    try:
+                        req = urllib.request.Request(cover_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=10) as r:
+                            cover_bytes = r.read()
+                        audio["covr"] = [MP4Cover(cover_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
+                    except Exception as ce:
+                        print(f"[Fallback] Cover embed notice: {ce}")
+                audio.save()
+                print(f"[Fallback] Successfully created and tagged: {target_m4a}")
+            except Exception as tag_err:
+                print(f"[Fallback] Tagging notice: {tag_err}")
+
+    except Exception as fallback_err:
+        print(f"[Fallback] Fallback error: {fallback_err}")
 
 
 @app.get("/api/download")
@@ -228,13 +305,20 @@ async def download_track(
     job_output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        meta = None
+        try:
+            meta = await metadata_client.get_metadata_from_url_async(url)
+        except Exception:
+            pass
+
         # Run the download in a non-blocking thread so other HTTP requests are served
         await asyncio.to_thread(
             _download_worker,
             url,
             str(job_output_dir),
             quality,
-            embed_lyrics
+            embed_lyrics,
+            meta
         )
 
         # Locate downloaded audio file
