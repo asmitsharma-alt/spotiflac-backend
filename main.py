@@ -49,7 +49,8 @@ async def lifespan(app: FastAPI):
     try:
         from SpotiFLAC.extensions import ExtensionManager
         em = ExtensionManager()
-        em.ensure_download_providers()
+        if not em.list_installed():
+            em.ensure_download_providers()
         print(f"[Extensions] Active extensions: {[e.name for e in em.list_installed()]}")
     except Exception as e:
         print(f"[Extensions] Setup notice: {e}")
@@ -221,6 +222,8 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
     print("[Fallback] Audio provider mirrors failed or blocked. Executing direct high-quality stream fallback...")
     try:
         import yt_dlp
+        from mutagen.flac import FLAC, Picture
+        from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC
         from mutagen.mp4 import MP4, MP4Cover
 
         title = getattr(meta, "title", "Track") if meta else "Track"
@@ -228,79 +231,187 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
         album = (getattr(meta, "album", "") if meta else "") or title
         cover_url = getattr(meta, "cover_url", "") if meta else ""
         year = str(getattr(meta, "release_date", ""))[:4] if meta and getattr(meta, "release_date", "") else ""
+        expected_duration = (getattr(meta, "duration_ms", 0) or 0) / 1000.0
 
         safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
         safe_artist = re.sub(r'[\\/*?:"<>|]', "", artists)
         base_filename = f"{safe_title} - {safe_artist}"
-        out_tmpl = os.path.join(output_dir, f"{base_filename}.%(ext)s")
 
-        # Try multi-platform direct audio extraction (YouTube Android player & SoundCloud)
+        quality_str = str(quality).upper()
+        if "LOSSLESS" in quality_str or "FLAC" in quality_str:
+            target_ext = "flac"
+            postprocessor = {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "flac",
+            }
+        else:
+            target_ext = "mp3"
+            postprocessor = {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "320" if "HIGH" in quality_str else "192",
+            }
+
+        out_tmpl = os.path.join(output_dir, f"{base_filename}.%(ext)s")
+        target_file = None
         download_success = False
-        fallback_queries = [
-            f"ytsearch1:{title} {artists} official audio",
-            f"scsearch1:{title} {artists}",
+
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "outtmpl": out_tmpl,
+            "postprocessors": [postprocessor],
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "tv_embedded"],
+                }
+            },
+        }
+
+        # Query candidates in order of quality & reliability
+        candidate_queries = [
+            ("youtube", f"ytsearch1:{title} {artists} official audio"),
+            ("youtube", f"ytsearch1:{title} {artists} topic"),
+            ("youtube", f"ytsearch1:{title} {artists}"),
         ]
 
-        for query_str in fallback_queries:
+        for source_name, query_str in candidate_queries:
             try:
-                print(f"[Fallback] Querying audio stream via: {query_str[:30]}...")
-                ydl_opts = {
-                    "format": "bestaudio/best",
-                    "quiet": True,
-                    "no_warnings": True,
-                    "outtmpl": out_tmpl,
-                    "extractor_args": {
-                        "youtube": [
-                            "player_client=android,ios",
-                            "player_skip=webpage,configs,js",
-                        ]
-                    },
-                    "postprocessors": [
-                        {
-                            "key": "FFmpegExtractAudio",
-                            "preferredcodec": "m4a",
-                            "preferredquality": "256",
-                        }
-                    ],
-                }
-
+                print(f"[Fallback] Querying {source_name} audio stream: {query_str[:40]}...")
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([query_str])
 
-                candidates = [
+                found = [
                     f for f in glob.glob(os.path.join(output_dir, "**/*.*"), recursive=True)
-                    if f.lower().endswith(('.m4a', '.mp3', '.flac', '.wav', '.ogg', '.opus'))
+                    if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
                 ]
-                if candidates and os.path.getsize(candidates[0]) > 50000:
-                    target_m4a = candidates[0]
-                    download_success = True
-                    break
-            except Exception as fe:
-                print(f"[Fallback] {query_str[:20]} attempt error: {fe}")
-
-        if download_success and os.path.exists(target_m4a):
-            try:
-                audio = MP4(target_m4a)
-                audio["\xa9nam"] = [title]
-                audio["\xa9ART"] = [artists]
-                audio["\xa9alb"] = [album]
-                if year:
-                    audio["\xa9day"] = [year]
-                if cover_url:
+                if found:
+                    cand = found[0]
+                    cand_duration = 0
                     try:
-                        req = urllib.request.Request(cover_url, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(req, timeout=10) as r:
-                            cover_bytes = r.read()
-                        audio["covr"] = [MP4Cover(cover_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
-                    except Exception as ce:
-                        print(f"[Fallback] Cover embed notice: {ce}")
-                audio.save()
-                print(f"[Fallback] Successfully created and tagged: {target_m4a}")
-            except Exception as tag_err:
-                print(f"[Fallback] Tagging notice: {tag_err}")
+                        import mutagen
+                        mf = mutagen.File(cand)
+                        if mf and hasattr(mf, "info") and hasattr(mf.info, "length"):
+                            cand_duration = mf.info.length
+                    except Exception:
+                        pass
 
+                    cand_size = os.path.getsize(cand)
+                    print(f"[Fallback] Candidate downloaded: {cand} (duration: {cand_duration:.1f}s, size: {cand_size} bytes)")
+
+                    # Require at least 65% of expected duration or 45s to reject 30s snippets
+                    min_allowed = min(expected_duration * 0.65, 45) if expected_duration > 45 else 20
+                    if cand_duration >= min_allowed:
+                        target_file = cand
+                        download_success = True
+                        break
+                    else:
+                        print(f"[Fallback] Candidate rejected as preview snippet (duration {cand_duration:.1f}s < {min_allowed:.1f}s). Purging...")
+                        try:
+                            os.remove(cand)
+                        except Exception:
+                            pass
+            except Exception as fe:
+                print(f"[Fallback] {source_name} query error: {fe}")
+
+        # If YouTube didn't yield a full track, try SoundCloud with duration search
+        if not download_success:
+            try:
+                print(f"[Fallback] Attempting SoundCloud full-track resolution for: {title} {artists}...")
+                sc_opts = {"quiet": True, "no_warnings": True, "extract_flat": False}
+                with yt_dlp.YoutubeDL(sc_opts) as ydl_sc:
+                    sc_res = ydl_sc.extract_info(f"scsearch10:{title} {artists} lyrics", download=False)
+                    best_url = None
+                    min_diff = 99999
+                    for entry in (sc_res.get("entries") or []):
+                        d = entry.get("duration") or 0
+                        # Reject snippets under 60 seconds when expected duration is long
+                        if expected_duration > 60 and d < 60:
+                            continue
+                        diff = abs(d - expected_duration) if expected_duration else 0
+                        if diff < min_diff:
+                            min_diff = diff
+                            best_url = entry.get("webpage_url")
+
+                    if best_url:
+                        print(f"[Fallback] Downloading best SoundCloud track: {best_url} (diff: {min_diff:.1f}s)...")
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl_dl:
+                            ydl_dl.download([best_url])
+
+                        found = [
+                            f for f in glob.glob(os.path.join(output_dir, "**/*.*"), recursive=True)
+                            if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
+                        ]
+                        if found:
+                            target_file = found[0]
+                            download_success = True
+            except Exception as sce:
+                print(f"[Fallback] SoundCloud resolution error: {sce}")
+
+        # Embed official metadata and album artwork
+        if download_success and target_file and os.path.exists(target_file):
+            cover_bytes = None
+            if cover_url:
+                try:
+                    req = urllib.request.Request(cover_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req, timeout=10) as r:
+                        cover_bytes = r.read()
+                except Exception as ce:
+                    print(f"[Fallback] Cover art download notice: {ce}")
+
+            ext = os.path.splitext(target_file)[1].lower()
+            if ext == ".flac":
+                try:
+                    audio = FLAC(target_file)
+                    audio["title"] = [title]
+                    audio["artist"] = [artists]
+                    audio["album"] = [album]
+                    if year:
+                        audio["date"] = [year]
+                    if cover_bytes:
+                        pic = Picture()
+                        pic.data = cover_bytes
+                        pic.type = 3
+                        pic.mime = "image/jpeg"
+                        audio.add_picture(pic)
+                    audio.save()
+                    print(f"[Fallback] Tagged FLAC: {target_file}")
+                except Exception as te:
+                    print(f"[Fallback] FLAC tag notice: {te}")
+            elif ext == ".mp3":
+                try:
+                    try:
+                        audio = ID3(target_file)
+                    except Exception:
+                        audio = ID3()
+                    audio.add(TIT2(encoding=3, text=title))
+                    audio.add(TPE1(encoding=3, text=artists))
+                    audio.add(TALB(encoding=3, text=album))
+                    if year:
+                        audio.add(TDRC(encoding=3, text=year))
+                    if cover_bytes:
+                        audio.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes))
+                    audio.save(target_file)
+                    print(f"[Fallback] Tagged MP3: {target_file}")
+                except Exception as te:
+                    print(f"[Fallback] MP3 tag notice: {te}")
+            elif ext == ".m4a":
+                try:
+                    audio = MP4(target_file)
+                    audio["\xa9nam"] = [title]
+                    audio["\xa9ART"] = [artists]
+                    audio["\xa9alb"] = [album]
+                    if year:
+                        audio["\xa9day"] = [year]
+                    if cover_bytes:
+                        audio["covr"] = [MP4Cover(cover_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
+                    audio.save()
+                    print(f"[Fallback] Tagged M4A: {target_file}")
+                except Exception as te:
+                    print(f"[Fallback] M4A tag notice: {te}")
     except Exception as fallback_err:
-        print(f"[Fallback] Fallback error: {fallback_err}")
+        print(f"[Fallback] Fallback engine error: {fallback_err}")
 
 
 @app.get("/api/download")
