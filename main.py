@@ -39,6 +39,16 @@ async def run_keep_alive(url: str, interval_minutes: int = 14):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global keep_alive_task
+
+    # Pre-sync and ensure SpotiFLAC download provider extensions are active
+    try:
+        from SpotiFLAC.extensions import ExtensionManager
+        em = ExtensionManager()
+        em.ensure_download_providers()
+        print(f"[Extensions] Active extensions: {[e.name for e in em.list_installed()]}")
+    except Exception as e:
+        print(f"[Extensions] Setup notice: {e}")
+
     external_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SERVER_URL")
     if external_url:
         keep_alive_task = asyncio.create_task(run_keep_alive(external_url))
@@ -106,17 +116,33 @@ async def get_track_info(
 
 def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool):
     """Synchronous worker function executed in an asyncio thread pool."""
+    import sys
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
     qobuz_token = os.getenv("QOBUZ_TOKEN") or None
     tidal_api = os.getenv("TIDAL_CUSTOM_API") or None
+
+    # Multi-provider fallback chain:
+    # 1. Qobuz & Deezer (Lossless FLAC)
+    # 2. YouTube Music (High-bitrate M4A/Opus) & SoundCloud as reliable fallbacks
+    services = ["qobuz", "deezer", "youtube", "soundcloud", "amazon"]
+    if tidal_api:
+        services.insert(0, "tidal")
 
     SpotiFLAC(
         url=url,
         output_dir=output_dir,
+        services=services,
         quality=quality,
         embed_lyrics=embed_lyrics,
         qobuz_token=qobuz_token,
         tidal_custom_api=tidal_api,
         allow_fallback=True,
+        timeout_s=45,
     )
 
 
@@ -155,7 +181,7 @@ async def download_track(
         downloaded_files = glob.glob(str(job_output_dir / "**/*.*"), recursive=True)
         audio_files = [
             f for f in downloaded_files
-            if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg'))
+            if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
         ]
 
         if not audio_files:
@@ -170,7 +196,16 @@ async def download_track(
         # Schedule automatic folder deletion after the response is delivered
         background_tasks.add_task(cleanup_directory, str(job_output_dir))
 
-        media_type = "audio/flac" if filename.lower().endswith(".flac") else "audio/mpeg"
+        ext = os.path.splitext(filename)[1].lower()
+        media_types = {
+            ".flac": "audio/flac",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".wav": "audio/wav",
+            ".ogg": "audio/ogg",
+            ".opus": "audio/opus",
+        }
+        media_type = media_types.get(ext, "application/octet-stream")
 
         return FileResponse(
             path=file_path,
