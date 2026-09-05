@@ -252,38 +252,41 @@ def probe_saavn(q: str = Query("I Wanna Be Yours", description="Search query")):
 
 
 @app.get("/api/probe-yt")
-def probe_yt(q: str = Query("Arctic Monkeys I Wanna Be Yours", description="Search query")):
-    """Diagnostic endpoint to inspect YouTube search & stream capabilities directly from the container."""
+def probe_yt(
+    vid: str = Query("nyuo9-OjNNg", description="YouTube video ID"),
+    client: str = Query("ios", description="Player client to test: ios, tv, mweb, android_vr, tv_embedded, web, android_music")
+):
+    """Diagnostic endpoint to test YouTube stream extraction for datacenter IP bypass."""
     import yt_dlp
-    flat_opts = {
+    opts = {
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": True,
+        "format": "bestaudio/best",
         "extractor_args": {
             "youtube": {
-                "player_client": ["android_creator", "tv_embedded", "mweb", "ios"]
+                "player_client": [client]
             }
         },
     }
-    with yt_dlp.YoutubeDL(flat_opts) as ydl:
+    with yt_dlp.YoutubeDL(opts) as ydl:
         try:
-            res = ydl.extract_info(f"ytsearch3:{q}", download=False)
-            entries = res.get("entries") or []
+            info = ydl.extract_info(f"https://www.youtube.com/watch?v={vid}", download=False)
+            url = info.get("url") or ""
             return {
-                "status": "ok",
-                "count": len(entries),
-                "entries": [
-                    {
-                        "id": e.get("id"),
-                        "title": e.get("title"),
-                        "uploader": e.get("channel") or e.get("uploader"),
-                        "duration": e.get("duration"),
-                    }
-                    for e in entries if e
-                ]
+                "status": "success",
+                "client": client,
+                "title": info.get("title"),
+                "has_stream_url": bool(url),
+                "url_snippet": url[:80] if url else None,
+                "format": info.get("format"),
+                "ext": info.get("ext"),
             }
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+            return {
+                "status": "error",
+                "client": client,
+                "error": str(e)
+            }
 
 
 @app.get("/api/info")
