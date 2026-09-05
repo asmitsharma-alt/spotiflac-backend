@@ -3,6 +3,9 @@ import uuid
 import glob
 import shutil
 import asyncio
+import time
+import re
+import difflib
 from pathlib import Path
 import contextlib
 from contextlib import asynccontextmanager
@@ -27,6 +30,9 @@ TEMP_DIR.mkdir(exist_ok=True)
 
 # Keep-alive task reference
 keep_alive_task = None
+
+# In-memory background jobs registry
+active_jobs: dict[str, dict] = {}
 
 
 async def run_keep_alive(url: str, interval_minutes: int = 14):
@@ -160,26 +166,143 @@ async def debug_info(url: str = Query("https://open.spotify.com/track/5XeFesFbtL
 
 @app.get("/api/info")
 async def get_track_info(
-    url: str = Query(..., description="Spotify track URL (e.g. https://open.spotify.com/track/...)")
+    url: str = Query(..., description="Spotify URL (track, album, playlist, or artist)")
 ):
-    """Fetches track metadata without downloading."""
-    if "open.spotify.com/track" not in url:
+    """Fetches metadata for a track, album, playlist, or artist without downloading."""
+    if "open.spotify.com" not in url:
         raise HTTPException(
             status_code=400,
-            detail="Invalid URL. Please provide a Spotify track URL."
+            detail="Invalid URL. Please provide a valid Spotify link."
         )
 
     try:
-        metadata = await metadata_client.get_metadata_from_url_async(url)
-        return metadata.model_dump()
+        name, tracks, cover, _ = await metadata_client.get_url_async(url)
+        if not tracks:
+            raise HTTPException(status_code=404, detail="No tracks found for this link.")
+
+        # Single track link
+        if "open.spotify.com/track/" in url:
+            meta = tracks[0]
+            meta_dict = meta.model_dump()
+            meta_dict["is_collection"] = False
+            return meta_dict
+
+        # Collection: Album, Playlist, or Artist
+        t_type = "album" if "/album/" in url else ("/playlist/" in url and "playlist" or "artist")
+        return {
+            "is_collection": True,
+            "type": t_type,
+            "name": name,
+            "cover_url": cover or (tracks[0].cover_url if tracks else ""),
+            "total_tracks": len(tracks),
+            "tracks": [
+                {
+                    "id": tr.id,
+                    "title": tr.title,
+                    "artists": tr.artists,
+                    "album": tr.album,
+                    "duration_ms": tr.duration_ms,
+                    "cover_url": tr.cover_url,
+                    "url": tr.external_url or f"https://open.spotify.com/track/{tr.id}"
+                }
+                for tr in tracks
+            ]
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch metadata: {str(e)}")
+
+
+def score_candidate(
+    cand_title: str,
+    cand_uploader: str,
+    cand_duration: float,
+    expected_title: str,
+    expected_artist: str,
+    expected_duration: float
+) -> tuple[float, str]:
+    """
+    Rigorously scores an audio stream candidate against expected metadata.
+    Returns (score, reason). Candidates with score <= 0 are rejected.
+    Filters out remixes, mashups, slowed+reverb, sped up, covers, and previews.
+    """
+    title_lower = (cand_title or "").lower()
+    uploader_lower = (cand_uploader or "").lower()
+    exp_title_lower = (expected_title or "").lower()
+    exp_artist_lower = (expected_artist or "").lower()
+
+    # Clean core expected title (strip parenthetical information like "(Remastered 2013)")
+    clean_exp_title = re.sub(r'\s*[\(\[].*?[\)\]]', '', exp_title_lower).strip()
+
+    # Banned modifications unless explicitly present in the original track title
+    banned_keywords = [
+        'mashup', 'mash up', 'remix', 'slowed', 'reverb', 'sped up', 'speed up', 'speedup',
+        'slower', 'faster', 'cover', 'tribute', 'karaoke', 'instrumental', 'acoustic',
+        'edit audio', 'edit)', 'tik tok', 'tiktok', 'nightcore', 'daycore', 'chopped',
+        'bass boosted', '8d audio', '8d', 'guitar cover', 'piano cover', 'drum cover',
+        'orchestral cover', 'backing track'
+    ]
+
+    for kw in banned_keywords:
+        if kw in title_lower and kw not in exp_title_lower:
+            return -1000.0, f"Disqualified: contains banned keyword '{kw}'"
+
+    # Reject artist mashups/versus unless in official metadata
+    if any(delim in title_lower for delim in [" x ", " X ", " vs ", " vs. ", " / "]):
+        if not any(delim in exp_title_lower or delim in exp_artist_lower for delim in [" x ", " X ", " vs ", " vs. "]):
+            return -1000.0, "Disqualified: contains mashup / versus delimiter"
+
+    # Title word match: ensure significant title words appear
+    words = re.findall(r'\b[a-zA-Z0-9]+\b', clean_exp_title)
+    sig_words = [w for w in words if len(w) >= 3 or w in ('be', 'me', 'we', 'go', 'do', 'no')]
+    if sig_words:
+        matched_words = [w for w in sig_words if w in title_lower]
+        coverage = len(matched_words) / len(sig_words)
+        if coverage < 0.65:
+            return -500.0, f"Disqualified: low title word coverage ({coverage:.2f})"
+
+    # Primary artist match (must appear in candidate title or uploader/channel)
+    primary_artist = re.split(r'[,&/]', exp_artist_lower)[0].strip()
+    artist_words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', primary_artist) if len(w) > 2]
+    artist_found = (primary_artist in title_lower or primary_artist in uploader_lower)
+    if not artist_found and artist_words:
+        artist_found = all(w in title_lower or w in uploader_lower for w in artist_words)
+
+    if not artist_found:
+        return -400.0, "Disqualified: primary artist missing from title and uploader"
+
+    # Duration validation
+    diff = 0.0
+    if expected_duration > 0 and cand_duration > 0:
+        if expected_duration > 60 and cand_duration < 55:
+            return -800.0, f"Disqualified: preview snippet ({cand_duration:.1f}s < 55s)"
+        diff = abs(cand_duration - expected_duration)
+        if diff > 35.0:
+            return -300.0, f"Disqualified: duration difference too large ({diff:.1f}s)"
+
+    # Base score
+    score = 100.0 - (diff * 2.5)
+
+    # Bonuses for authentic uploads
+    if "official" in title_lower or "official" in uploader_lower:
+        score += 15.0
+    if "topic" in uploader_lower or "vevo" in uploader_lower:
+        score += 25.0
+    if "lyrics" in title_lower and not ("edit" in title_lower or "mashup" in title_lower):
+        score += 8.0
+    if primary_artist in uploader_lower:
+        score += 20.0
+
+    sim = difflib.SequenceMatcher(None, f"{clean_exp_title} {primary_artist}", title_lower).ratio()
+    score += (sim * 20.0)
+
+    return score, f"Score: {score:.1f}"
 
 
 def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool, meta=None):
     """Synchronous worker function executed in an asyncio thread pool."""
     import sys
-    import re
     import urllib.request
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -190,7 +313,8 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
     qobuz_token = os.getenv("QOBUZ_TOKEN") or None
     tidal_api = os.getenv("TIDAL_CUSTOM_API") or None
 
-    services = ["youtube", "soundcloud", "qobuz", "deezer", "amazon"]
+    # Lossless services (SoundCloud explicitly removed per user requirement)
+    services = ["youtube", "qobuz", "deezer", "amazon"]
     if tidal_api:
         services.insert(0, "tidal")
 
@@ -209,7 +333,7 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
             timeout_s=60,
         )
     except Exception as e:
-        print(f"[SpotiFLAC] Run notice: {e}")
+        print(f"[SpotiFLAC] Primary run notice: {e}")
 
     # Check if SpotiFLAC produced an audio file
     downloaded = glob.glob(str(Path(output_dir) / "**/*.*"), recursive=True)
@@ -220,8 +344,8 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
     if audio_files:
         return
 
-    # 2. Resilient Direct Stream Fallback via yt-dlp & mutagen
-    print("[Fallback] Audio provider mirrors failed or blocked. Executing direct high-quality stream fallback...")
+    # 2. Resilient Direct Stream Fallback via YouTube with Candidate Verification
+    print("[Fallback] Hi-Res mirrors busy. Executing verified studio stream fallback...")
     try:
         import yt_dlp
         from mutagen.flac import FLAC, Picture
@@ -258,7 +382,18 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
         target_file = None
         download_success = False
 
-        ydl_opts = {
+        flat_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": True,
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "ios", "web_embedded", "tv_embedded", "mweb"]
+                }
+            },
+        }
+
+        ydl_dl_opts = {
             "format": "bestaudio/best",
             "quiet": True,
             "no_warnings": True,
@@ -266,23 +401,59 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
             "postprocessors": [postprocessor],
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "tv_embedded"],
+                    "player_client": ["android", "ios", "web_embedded", "tv_embedded", "mweb"]
                 }
             },
         }
 
-        # Query candidates in order of quality & reliability
-        candidate_queries = [
-            ("youtube", f"ytsearch1:{title} {artists} official audio"),
-            ("youtube", f"ytsearch1:{title} {artists} topic"),
-            ("youtube", f"ytsearch1:{title} {artists}"),
+        # Multi-query strategy for YouTube
+        search_queries = [
+            f"ytsearch5:{title} {artists} official audio",
+            f"ytsearch5:{title} {artists} topic",
+            f"ytsearch5:{artists} - {title}",
+            f"ytsearch5:{title} {artists}",
         ]
 
-        for source_name, query_str in candidate_queries:
+        scored_candidates = []
+        seen_ids = set()
+
+        with yt_dlp.YoutubeDL(flat_opts) as ydl_flat:
+            for q in search_queries:
+                try:
+                    res = ydl_flat.extract_info(q, download=False)
+                    for entry in (res.get("entries") or []):
+                        if not entry:
+                            continue
+                        vid = entry.get("id")
+                        if not vid or vid in seen_ids:
+                            continue
+                        seen_ids.add(vid)
+
+                        c_title = entry.get("title") or ""
+                        c_uploader = entry.get("channel") or entry.get("uploader") or ""
+                        c_dur = float(entry.get("duration") or 0)
+                        c_url = entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
+
+                        sc, reason = score_candidate(c_title, c_uploader, c_dur, title, artists, expected_duration)
+                        print(f"[Fallback Candidate] Score {sc:5.1f}: '{c_title}' ({c_dur}s) - {reason}")
+                        if sc > 0:
+                            scored_candidates.append({
+                                "score": sc,
+                                "url": c_url,
+                                "title": c_title,
+                                "duration": c_dur,
+                            })
+                except Exception as qe:
+                    print(f"[Fallback Search] Query error on '{q[:30]}': {qe}")
+
+        # Sort candidates descending by match score
+        scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        for cand_info in scored_candidates[:3]:
             try:
-                print(f"[Fallback] Querying {source_name} audio stream: {query_str[:40]}...")
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([query_str])
+                print(f"[Fallback Download] Attempting candidate (score {cand_info['score']:.1f}): {cand_info['title']}...")
+                with yt_dlp.YoutubeDL(ydl_dl_opts) as ydl_dl:
+                    ydl_dl.download([cand_info["url"]])
 
                 found = [
                     f for f in glob.glob(os.path.join(output_dir, "**/*.*"), recursive=True)
@@ -300,56 +471,21 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
                         pass
 
                     cand_size = os.path.getsize(cand)
-                    print(f"[Fallback] Candidate downloaded: {cand} (duration: {cand_duration:.1f}s, size: {cand_size} bytes)")
+                    print(f"[Fallback] Downloaded: {cand} (duration: {cand_duration:.1f}s, size: {cand_size} bytes)")
 
-                    # Require at least 65% of expected duration or 45s to reject 30s snippets
                     min_allowed = min(expected_duration * 0.65, 45) if expected_duration > 45 else 20
                     if cand_duration >= min_allowed:
                         target_file = cand
                         download_success = True
                         break
                     else:
-                        print(f"[Fallback] Candidate rejected as preview snippet (duration {cand_duration:.1f}s < {min_allowed:.1f}s). Purging...")
+                        print(f"[Fallback] Rejected as preview snippet ({cand_duration:.1f}s < {min_allowed:.1f}s).")
                         try:
                             os.remove(cand)
                         except Exception:
                             pass
-            except Exception as fe:
-                print(f"[Fallback] {source_name} query error: {fe}")
-
-        # If YouTube didn't yield a full track, try SoundCloud with duration search
-        if not download_success:
-            try:
-                print(f"[Fallback] Attempting SoundCloud full-track resolution for: {title} {artists}...")
-                sc_opts = {"quiet": True, "no_warnings": True, "extract_flat": False}
-                with yt_dlp.YoutubeDL(sc_opts) as ydl_sc:
-                    sc_res = ydl_sc.extract_info(f"scsearch10:{title} {artists} lyrics", download=False)
-                    best_url = None
-                    min_diff = 99999
-                    for entry in (sc_res.get("entries") or []):
-                        d = entry.get("duration") or 0
-                        # Reject snippets under 60 seconds when expected duration is long
-                        if expected_duration > 60 and d < 60:
-                            continue
-                        diff = abs(d - expected_duration) if expected_duration else 0
-                        if diff < min_diff:
-                            min_diff = diff
-                            best_url = entry.get("webpage_url")
-
-                    if best_url:
-                        print(f"[Fallback] Downloading best SoundCloud track: {best_url} (diff: {min_diff:.1f}s)...")
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl_dl:
-                            ydl_dl.download([best_url])
-
-                        found = [
-                            f for f in glob.glob(os.path.join(output_dir, "**/*.*"), recursive=True)
-                            if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
-                        ]
-                        if found:
-                            target_file = found[0]
-                            download_success = True
-            except Exception as sce:
-                print(f"[Fallback] SoundCloud resolution error: {sce}")
+            except Exception as de:
+                print(f"[Fallback Download] Failed on candidate: {de}")
 
         # Embed official metadata and album artwork
         if download_success and target_file and os.path.exists(target_file):
@@ -504,13 +640,21 @@ class SaveToDriveRequest(BaseModel):
     quality: str = "LOSSLESS"
     embed_lyrics: bool = True
     access_token: str
+    folder_name: str = "SpotiFLAC"
 
 
-async def get_or_create_drive_folder(client: httpx.AsyncClient, access_token: str, folder_name: str = "SpotiFLAC") -> str:
-    """Finds or creates a target folder in user's Google Drive."""
+async def get_or_create_drive_folder(
+    client: httpx.AsyncClient,
+    access_token: str,
+    folder_name: str = "SpotiFLAC",
+    parent_id: str | None = None
+) -> str:
+    """Finds or creates a target folder in user's Google Drive, optionally under a parent folder."""
     headers = {"Authorization": f"Bearer {access_token}"}
     query = f"mimeType = 'application/vnd.google-apps.folder' and name = '{folder_name}' and trashed = false"
-    
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+
     try:
         res = await client.get(
             "https://www.googleapis.com/drive/v3/files",
@@ -525,16 +669,19 @@ async def get_or_create_drive_folder(client: httpx.AsyncClient, access_token: st
     except Exception as e:
         print(f"[GDrive] Search folder notice: {e}")
 
-    # Create folder if not found
+    create_payload = {"name": folder_name, "mimeType": "application/vnd.google-apps.folder"}
+    if parent_id:
+        create_payload["parents"] = [parent_id]
+
     create_res = await client.post(
         "https://www.googleapis.com/drive/v3/files",
         headers={**headers, "Content-Type": "application/json"},
-        json={"name": folder_name, "mimeType": "application/vnd.google-apps.folder"},
+        json=create_payload,
         timeout=15.0
     )
     if create_res.status_code in (200, 201):
         return create_res.json()["id"]
-    
+
     raise HTTPException(
         status_code=create_res.status_code,
         detail=f"Google Drive folder creation failed: {create_res.text}"
@@ -587,8 +734,8 @@ async def save_to_drive(
     background_tasks: BackgroundTasks
 ):
     """
-    Downloads track on server and uploads directly to the user's Google Drive.
-    The client device downloads 0 bytes of media.
+    Synchronous direct upload endpoint for a single track.
+    (Kept for backward compatibility).
     """
     if "open.spotify.com/track" not in req.url:
         raise HTTPException(
@@ -608,11 +755,12 @@ async def save_to_drive(
     try:
         meta = None
         try:
-            meta = await metadata_client.get_metadata_from_url_async(req.url)
+            _, trs, _, _ = await metadata_client.get_url_async(req.url)
+            if trs:
+                meta = trs[0]
         except Exception:
             pass
 
-        # Execute download and transcoding on server
         await asyncio.to_thread(
             _download_worker,
             req.url,
@@ -647,12 +795,10 @@ async def save_to_drive(
         }
         mime_type = media_types.get(ext, "application/octet-stream")
 
-        # Stream directly to user's Google Drive
         async with httpx.AsyncClient(timeout=180.0) as client:
             folder_id = await get_or_create_drive_folder(client, req.access_token, "SpotiFLAC")
             drive_file = await upload_file_to_drive(client, req.access_token, file_path, filename, mime_type, folder_id)
 
-        # Purge temporary audio from server storage
         background_tasks.add_task(cleanup_directory, str(job_output_dir))
 
         file_id = drive_file.get("id")
@@ -675,4 +821,221 @@ async def save_to_drive(
             status_code=500,
             detail=f"Google Drive cloud transfer error: {str(e)}"
         )
+
+
+# ===========================================================================
+# Autonomous Cloud Background Jobs (Detached from client browser tab)
+# ===========================================================================
+
+async def run_drive_job(
+    job_id: str,
+    tracks: list,
+    quality: str,
+    embed_lyrics: bool,
+    access_token: str,
+    base_folder_name: str = "SpotiFLAC",
+    subfolder_name: str | None = None
+):
+    """
+    Independent server-side worker that downloads and uploads songs to Google Drive.
+    Runs detached in the background — continues running even if user closes tab.
+    """
+    job = active_jobs.get(job_id)
+    if not job:
+        return
+
+    job["status"] = "in_progress"
+    job["updated_at"] = time.time()
+    print(f"[DriveJob {job_id[:8]}] Started processing {len(tracks)} track(s)...")
+
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        try:
+            base_id = await get_or_create_drive_folder(client, access_token, base_folder_name)
+            target_folder_id = base_id
+            if subfolder_name:
+                # Clean invalid folder name characters
+                safe_subfolder = re.sub(r'[\\/*?:"<>|]', "", subfolder_name).strip()
+                if safe_subfolder:
+                    target_folder_id = await get_or_create_drive_folder(
+                        client, access_token, safe_subfolder, parent_id=base_id
+                    )
+        except Exception as fe:
+            job["status"] = "failed"
+            job["error"] = f"Failed to initialize Google Drive folder: {str(fe)}"
+            job["updated_at"] = time.time()
+            print(f"[DriveJob {job_id[:8]}] Folder init failed: {fe}")
+            return
+
+        for idx, tr in enumerate(tracks):
+            track_title = tr.title
+            track_artists = tr.artists
+            track_url = tr.external_url or f"https://open.spotify.com/track/{tr.id}"
+
+            job["current_track_title"] = f"{track_title} - {track_artists}"
+            job["current_track_index"] = idx + 1
+            job["updated_at"] = time.time()
+
+            track_dir = TEMP_DIR / f"{job_id}_{idx}"
+            track_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Processing: {track_title}...")
+                await asyncio.to_thread(
+                    _download_worker,
+                    track_url,
+                    str(track_dir),
+                    quality,
+                    embed_lyrics,
+                    meta=tr
+                )
+
+                downloaded_files = glob.glob(str(track_dir / "**/*.*"), recursive=True)
+                audio_files = [
+                    f for f in downloaded_files
+                    if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
+                ]
+
+                if not audio_files:
+                    raise Exception("Audio stream could not be extracted from providers.")
+
+                file_path = audio_files[0]
+                filename = os.path.basename(file_path)
+                ext = os.path.splitext(filename)[1].lower()
+                media_types = {
+                    ".flac": "audio/flac",
+                    ".mp3": "audio/mpeg",
+                    ".m4a": "audio/mp4",
+                    ".wav": "audio/wav",
+                    ".ogg": "audio/ogg",
+                    ".opus": "audio/opus",
+                }
+                mime_type = media_types.get(ext, "application/octet-stream")
+
+                drive_file = await upload_file_to_drive(
+                    client,
+                    access_token,
+                    file_path,
+                    filename,
+                    mime_type,
+                    target_folder_id
+                )
+
+                file_id = drive_file.get("id")
+                web_link = drive_file.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+
+                job["items"].append({
+                    "title": track_title,
+                    "artists": track_artists,
+                    "status": "completed",
+                    "file_name": filename,
+                    "file_id": file_id,
+                    "web_view_link": web_link,
+                    "size": drive_file.get("size"),
+                })
+                job["completed_tracks"] += 1
+                print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Uploaded to Drive: {filename}")
+            except Exception as item_err:
+                print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Error: {item_err}")
+                job["items"].append({
+                    "title": track_title,
+                    "artists": track_artists,
+                    "status": "failed",
+                    "error": str(item_err),
+                })
+                job["failed_tracks"] += 1
+            finally:
+                cleanup_directory(str(track_dir))
+                job["updated_at"] = time.time()
+
+    if job["completed_tracks"] > 0:
+        job["status"] = "completed"
+    else:
+        job["status"] = "failed"
+        job["error"] = "No tracks could be downloaded and uploaded."
+    job["updated_at"] = time.time()
+    print(f"[DriveJob {job_id[:8]}] Finished: {job['completed_tracks']} succeeded, {job['failed_tracks']} failed.")
+
+
+@app.post("/api/jobs/save-to-drive")
+async def create_drive_job(req: SaveToDriveRequest):
+    """
+    Creates an asynchronous Google Drive background job.
+    Returns immediately so the client can safely close the tab while the server processes.
+    """
+    if "open.spotify.com" not in req.url:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid Spotify URL. Please provide a valid Spotify link."
+        )
+    if not req.access_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Google Drive access token."
+        )
+
+    try:
+        name, tracks, cover, _ = await metadata_client.get_url_async(req.url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to fetch Spotify metadata: {e}")
+
+    if not tracks:
+        raise HTTPException(status_code=404, detail="No tracks found for this link.")
+
+    job_id = str(uuid.uuid4())
+    is_collection = len(tracks) > 1 or ("/album/" in req.url) or ("/playlist/" in req.url)
+    subfolder = name if is_collection else None
+
+    active_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "queued",
+        "url": req.url,
+        "name": name,
+        "cover_url": cover or (tracks[0].cover_url if tracks else ""),
+        "total_tracks": len(tracks),
+        "completed_tracks": 0,
+        "failed_tracks": 0,
+        "current_track_title": "",
+        "current_track_index": 0,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+        "items": [],
+        "error": None,
+    }
+
+    # Start detached background task on server
+    asyncio.create_task(
+        run_drive_job(
+            job_id=job_id,
+            tracks=tracks,
+            quality=req.quality,
+            embed_lyrics=req.embed_lyrics,
+            access_token=req.access_token,
+            base_folder_name=req.folder_name or "SpotiFLAC",
+            subfolder_name=subfolder,
+        )
+    )
+
+    return {
+        "job_id": job_id,
+        "status": "queued",
+        "name": name,
+        "total_tracks": len(tracks),
+        "message": "Cloud transfer job queued. You can safely close this browser tab!"
+    }
+
+
+@app.get("/api/jobs/{job_id}")
+async def get_job_status(job_id: str):
+    """Fetches real-time status and progress for a background Google Drive job."""
+    job = active_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found or expired.")
+    return job
+
+
+@app.get("/api/jobs")
+async def list_jobs():
+    """Lists the 20 most recent background jobs."""
+    sorted_jobs = sorted(active_jobs.values(), key=lambda j: j.get("created_at", 0), reverse=True)[:20]
+    return sorted_jobs
 
