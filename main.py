@@ -6,8 +6,10 @@ import asyncio
 from pathlib import Path
 import contextlib
 from contextlib import asynccontextmanager
+import json
 import httpx
 from dotenv import load_dotenv
+from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -495,3 +497,182 @@ async def download_track(
     except Exception as e:
         cleanup_directory(str(job_output_dir))
         raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+
+
+class SaveToDriveRequest(BaseModel):
+    url: str
+    quality: str = "LOSSLESS"
+    embed_lyrics: bool = True
+    access_token: str
+
+
+async def get_or_create_drive_folder(client: httpx.AsyncClient, access_token: str, folder_name: str = "SpotiFLAC") -> str:
+    """Finds or creates a target folder in user's Google Drive."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    query = f"mimeType = 'application/vnd.google-apps.folder' and name = '{folder_name}' and trashed = false"
+    
+    try:
+        res = await client.get(
+            "https://www.googleapis.com/drive/v3/files",
+            headers=headers,
+            params={"q": query, "spaces": "drive", "fields": "files(id, name)"},
+            timeout=15.0
+        )
+        if res.status_code == 200:
+            files = res.json().get("files", [])
+            if files:
+                return files[0]["id"]
+    except Exception as e:
+        print(f"[GDrive] Search folder notice: {e}")
+
+    # Create folder if not found
+    create_res = await client.post(
+        "https://www.googleapis.com/drive/v3/files",
+        headers={**headers, "Content-Type": "application/json"},
+        json={"name": folder_name, "mimeType": "application/vnd.google-apps.folder"},
+        timeout=15.0
+    )
+    if create_res.status_code in (200, 201):
+        return create_res.json()["id"]
+    
+    raise HTTPException(
+        status_code=create_res.status_code,
+        detail=f"Google Drive folder creation failed: {create_res.text}"
+    )
+
+
+async def upload_file_to_drive(client: httpx.AsyncClient, access_token: str, file_path: str, filename: str, mime_type: str, folder_id: str) -> dict:
+    """Uploads a local audio file directly into Google Drive via multipart upload."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    boundary = f"boundary_{uuid.uuid4().hex}"
+
+    metadata_bytes = json.dumps({"name": filename, "parents": [folder_id]}).encode("utf-8")
+    with open(file_path, "rb") as f:
+        file_bytes = f.read()
+
+    body = (
+        f"--{boundary}\r\n"
+        f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+    ).encode("utf-8") + metadata_bytes + (
+        f"\r\n--{boundary}\r\n"
+        f"Content-Type: {mime_type}\r\n\r\n"
+    ).encode("utf-8") + file_bytes + (
+        f"\r\n--{boundary}--\r\n"
+    ).encode("utf-8")
+
+    upload_headers = {
+        **headers,
+        "Content-Type": f"multipart/related; boundary={boundary}",
+        "Content-Length": str(len(body)),
+    }
+
+    res = await client.post(
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,webViewLink,size",
+        headers=upload_headers,
+        content=body,
+        timeout=180.0
+    )
+    if res.status_code in (200, 201):
+        return res.json()
+
+    raise HTTPException(
+        status_code=res.status_code,
+        detail=f"Google Drive upload failed: {res.text}"
+    )
+
+
+@app.post("/api/save-to-drive")
+async def save_to_drive(
+    req: SaveToDriveRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Downloads track on server and uploads directly to the user's Google Drive.
+    The client device downloads 0 bytes of media.
+    """
+    if "open.spotify.com/track" not in req.url:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid URL. Please provide a valid Spotify track link."
+        )
+    if not req.access_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing Google Drive access token."
+        )
+
+    job_id = str(uuid.uuid4())
+    job_output_dir = TEMP_DIR / job_id
+    job_output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        meta = None
+        try:
+            meta = await metadata_client.get_metadata_from_url_async(req.url)
+        except Exception:
+            pass
+
+        # Execute download and transcoding on server
+        await asyncio.to_thread(
+            _download_worker,
+            req.url,
+            str(job_output_dir),
+            req.quality,
+            req.embed_lyrics,
+            meta
+        )
+
+        downloaded_files = glob.glob(str(job_output_dir / "**/*.*"), recursive=True)
+        audio_files = [
+            f for f in downloaded_files
+            if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
+        ]
+
+        if not audio_files:
+            raise HTTPException(
+                status_code=404,
+                detail="Track could not be retrieved from audio providers."
+            )
+
+        file_path = audio_files[0]
+        filename = os.path.basename(file_path)
+        ext = os.path.splitext(filename)[1].lower()
+        media_types = {
+            ".flac": "audio/flac",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".wav": "audio/wav",
+            ".ogg": "audio/ogg",
+            ".opus": "audio/opus",
+        }
+        mime_type = media_types.get(ext, "application/octet-stream")
+
+        # Stream directly to user's Google Drive
+        async with httpx.AsyncClient(timeout=180.0) as client:
+            folder_id = await get_or_create_drive_folder(client, req.access_token, "SpotiFLAC")
+            drive_file = await upload_file_to_drive(client, req.access_token, file_path, filename, mime_type, folder_id)
+
+        # Purge temporary audio from server storage
+        background_tasks.add_task(cleanup_directory, str(job_output_dir))
+
+        file_id = drive_file.get("id")
+        web_link = drive_file.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+
+        return {
+            "success": True,
+            "file_id": file_id,
+            "file_name": filename,
+            "folder_name": "SpotiFLAC",
+            "web_view_link": web_link,
+            "size": drive_file.get("size")
+        }
+    except HTTPException:
+        cleanup_directory(str(job_output_dir))
+        raise
+    except Exception as e:
+        cleanup_directory(str(job_output_dir))
+        raise HTTPException(
+            status_code=500,
+            detail=f"Google Drive cloud transfer error: {str(e)}"
+        )
+
