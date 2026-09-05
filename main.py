@@ -145,9 +145,17 @@ async def debug_info(url: str = Query("https://open.spotify.com/track/5XeFesFbtL
     debug_dir = TEMP_DIR / f"debug_{uuid.uuid4().hex[:8]}"
     debug_dir.mkdir(parents=True, exist_ok=True)
     
+    meta = None
+    try:
+        _, tracks, _, _ = await metadata_client.get_url_async(url)
+        if tracks:
+            meta = tracks[0]
+    except Exception as me:
+        err = f"Metadata error: {me}"
+
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         try:
-            await asyncio.to_thread(_download_worker, url, str(debug_dir), "LOSSLESS", False)
+            await asyncio.to_thread(_download_worker, url, str(debug_dir), "LOSSLESS", False, meta)
             downloaded = [os.path.basename(f) for f in glob.glob(str(debug_dir / "**/*.*"), recursive=True)]
         except Exception as e:
             err = traceback.format_exc()
@@ -317,12 +325,15 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
     qobuz_token = os.getenv("QOBUZ_TOKEN") or None
     tidal_api = os.getenv("TIDAL_CUSTOM_API") or None
 
-    has_isrc = bool(getattr(meta, "isrc", None))
-    if has_isrc:
-        # Verified ISRC present: Prioritize True 24-bit Studio Master Lossless FLAC
+    isrc_str = str(getattr(meta, "isrc", "") or "").strip().upper()
+    western_prefixes = ("US", "GB", "UK", "FR", "DE", "CA", "AU", "SE", "NL", "IT", "ES")
+    is_western = any(isrc_str.startswith(p) for p in western_prefixes)
+
+    if is_western:
+        # Western releases with European/US ISRC: Prioritize Amazon 24-bit Studio Master FLAC
         services = ["amazon", "qobuz", "deezer", "youtube"]
     else:
-        # Regional / Bollywood track without Western ISRC: Prioritize YouTube Music for instant <5s extraction
+        # Regional / Bollywood / Asian tracks: Prioritize YouTube Music for instant <4s extraction
         services = ["youtube", "amazon", "deezer"]
     if tidal_api:
         services.insert(1, "tidal")
@@ -339,10 +350,11 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
             quality=quality,
             embed_lyrics=False,
             enrich_metadata=False,
+            track_max_retries=0,
             qobuz_token=qobuz_token,
             tidal_custom_api=tidal_api,
             allow_fallback=True,
-            timeout_s=35,
+            timeout_s=30,
         )
         dl = SpotiflacDownloader(opts)
         thread_loop.run_until_complete(dl.run_async(url))
@@ -648,7 +660,9 @@ async def download_track(
     try:
         meta = None
         try:
-            meta = await metadata_client.get_metadata_from_url_async(url)
+            _, tracks, _, _ = await metadata_client.get_url_async(url)
+            if tracks:
+                meta = tracks[0]
         except Exception:
             pass
 
