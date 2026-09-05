@@ -160,14 +160,19 @@ async def debug_info(url: str = Query("https://open.spotify.com/track/5XeFesFbtL
     except Exception as me:
         err = f"Metadata error: {me}"
 
+    worker_logs = []
     with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
         try:
-            await asyncio.to_thread(_download_worker, url, str(debug_dir), "LOSSLESS", False, meta)
+            await asyncio.to_thread(_download_worker, url, str(debug_dir), "LOSSLESS", False, meta, worker_logs)
             downloaded = [f"{os.path.basename(f)} ({os.path.getsize(f)} bytes)" for f in glob.glob(str(debug_dir / "**/*.*"), recursive=True)]
         except Exception as e:
             err = traceback.format_exc()
         finally:
             shutil.rmtree(debug_dir, ignore_errors=True)
+
+    combined_logs = buf.getvalue()
+    if worker_logs:
+        combined_logs = (combined_logs + "\n" if combined_logs else "") + "\n".join(worker_logs)
 
     return {
         "node": node_out,
@@ -175,8 +180,75 @@ async def debug_info(url: str = Query("https://open.spotify.com/track/5XeFesFbtL
         "installed_extensions": exts,
         "downloaded_files": downloaded,
         "error": err,
-        "logs": buf.getvalue(),
+        "logs": combined_logs,
     }
+
+
+@app.get("/api/probe-saavn")
+def probe_saavn(q: str = Query("I Wanna Be Yours", description="Search query")):
+    """Diagnostic endpoint to inspect JioSaavn API responses directly from the container."""
+    results = {}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept-Language": "en-US,en;q=0.9",
+        "cookie": "L=english%2Chindi"
+    }
+
+    try:
+        r1 = httpx.get("https://www.jiosaavn.com/api.php", params={
+            "__call": "search.getResults",
+            "_marker": "0",
+            "q": q,
+            "ctx": "android",
+            "_format": "json",
+            "p": "1",
+            "n": "5"
+        }, headers=headers, timeout=8.0)
+        items = r1.json().get("results", [])
+        results["search"] = {
+            "status": r1.status_code,
+            "count": len(items),
+            "items": [
+                {
+                    "id": it.get("id"),
+                    "song": it.get("song"),
+                    "singers": it.get("singers"),
+                    "primary_artists": it.get("primary_artists"),
+                    "duration": it.get("duration"),
+                }
+                for it in items[:3]
+            ]
+        }
+    except Exception as e:
+        results["search"] = {"error": str(e)}
+
+    try:
+        r2 = httpx.get("https://www.jiosaavn.com/api.php", params={
+            "__call": "autocomplete.get",
+            "_marker": "0",
+            "query": q,
+            "ctx": "android",
+            "_format": "json"
+        }, headers=headers, timeout=8.0)
+        ac_items = r2.json().get("songs", {}).get("data", [])
+        results["autocomplete"] = {
+            "status": r2.status_code,
+            "count": len(ac_items),
+            "items": [
+                {
+                    "id": it.get("id"),
+                    "title": it.get("title"),
+                    "description": it.get("description"),
+                    "singers": it.get("more_info", {}).get("singers"),
+                    "primary_artists": it.get("more_info", {}).get("primary_artists"),
+                }
+                for it in ac_items[:3]
+            ]
+        }
+    except Exception as e:
+        results["autocomplete"] = {"error": str(e)}
+
+    return results
 
 
 @app.get("/api/info")
@@ -392,7 +464,35 @@ def score_saavn_candidate(
     return score
 
 
-def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS") -> str | None:
+def extract_saavn_meta(item: dict) -> tuple[str, str, float]:
+    """Extracts title, combined artist string, and duration from search or autocomplete item."""
+    s_title = item.get("song") or item.get("title") or ""
+    artists = []
+    if item.get("singers"):
+        artists.append(str(item["singers"]))
+    if item.get("primary_artists"):
+        artists.append(str(item["primary_artists"]))
+    if item.get("music"):
+        artists.append(str(item["music"]))
+
+    more = item.get("more_info") or {}
+    if isinstance(more, dict):
+        if more.get("singers"):
+            artists.append(str(more["singers"]))
+        if more.get("primary_artists"):
+            artists.append(str(more["primary_artists"]))
+        if more.get("artistMap") and isinstance(more["artistMap"], dict):
+            artists.extend(more["artistMap"].keys())
+
+    if item.get("description"):
+        artists.append(str(item["description"]))
+
+    s_artist = ", ".join(dict.fromkeys([a for a in artists if a]))
+    s_dur = float(item.get("duration") or (more.get("duration") if isinstance(more, dict) else 0) or 0)
+    return s_title, s_artist, s_dur
+
+
+def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS", log_list: list = None) -> str | None:
     """
     Direct Studio Master extraction via JioSaavn CDN Engine.
     Streams 320 kbps MP3/AAC directly from CDN, transcodes to FLAC (or 320k MP3),
@@ -403,6 +503,11 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS") -> str | No
     import subprocess
     from mutagen.flac import FLAC, Picture
     from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC
+
+    def log(msg: str):
+        print(msg, flush=True)
+        if log_list is not None:
+            log_list.append(str(msg))
 
     title = getattr(meta, "title", "Track")
     artists = getattr(meta, "artists", "Artist")
@@ -420,8 +525,14 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS") -> str | No
 
     queries = [f"{title} {artists}", f"{artists} {title}", title]
     candidates = []
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    seen_pids = set()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept-Language": "en-US,en;q=0.9",
+        "cookie": "L=english%2Chindi"
+    }
 
+    # 1. Search via search.getResults
     for q in queries:
         try:
             r = httpx.get(
@@ -442,24 +553,59 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS") -> str | No
                 results = r.json().get("results", [])
                 for item in results:
                     pid = item.get("id")
-                    s_title = item.get("song", "")
-                    s_artist = item.get("singers", "")
-                    s_dur = float(item.get("duration", 0) or 0)
+                    if not pid or pid in seen_pids:
+                        continue
+                    s_title, s_artist, s_dur = extract_saavn_meta(item)
                     sc = score_saavn_candidate(s_title, s_artist, s_dur, title, artists, exp_dur)
                     if sc > 50:
-                        candidates.append((sc, pid, s_title))
+                        seen_pids.add(pid)
+                        candidates.append((sc, pid, s_title, s_dur))
                 if candidates:
+                    log(f"[Saavn] Found {len(candidates)} candidate(s) via search query '{q}'")
                     break
         except Exception as e:
-            print(f"[Saavn] Search error for '{q[:30]}': {e}")
+            log(f"[Saavn] Search error for '{q[:30]}': {e}")
+
+    # 2. Search via autocomplete.get fallback (crucial for international/Western catalog indexing)
+    if not candidates:
+        for q in [f"{title} {artists}", title]:
+            try:
+                r = httpx.get(
+                    "https://www.jiosaavn.com/api.php",
+                    params={
+                        "__call": "autocomplete.get",
+                        "_marker": "0",
+                        "query": q,
+                        "ctx": "android",
+                        "_format": "json"
+                    },
+                    headers=headers,
+                    timeout=8.0
+                )
+                if r.status_code == 200:
+                    songs = r.json().get("songs", {}).get("data", [])
+                    for item in songs:
+                        pid = item.get("id")
+                        if not pid or pid in seen_pids:
+                            continue
+                        s_title, s_artist, s_dur = extract_saavn_meta(item)
+                        sc = score_saavn_candidate(s_title, s_artist, s_dur, title, artists, exp_dur)
+                        if sc > 50:
+                            seen_pids.add(pid)
+                            candidates.append((sc, pid, s_title, s_dur))
+                    if candidates:
+                        log(f"[Saavn] Found {len(candidates)} candidate(s) via autocomplete query '{q}'")
+                        break
+            except Exception as e:
+                log(f"[Saavn] Autocomplete error for '{q[:30]}': {e}")
 
     if not candidates:
-        print("[Saavn] No high-scoring candidates found.")
+        log(f"[Saavn] No verified candidates found for '{title} - {artists}'.")
         return None
 
     candidates.sort(key=lambda x: x[0], reverse=True)
 
-    for sc, pid, s_title in candidates[:2]:
+    for sc, pid, s_title, s_dur in candidates[:3]:
         try:
             det_res = httpx.get(
                 "https://www.jiosaavn.com/api.php",
@@ -473,6 +619,12 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS") -> str | No
                 timeout=8.0
             )
             det = det_res.json().get(pid, {})
+            # Verify duration if candidate duration was 0 from autocomplete
+            det_dur = float(det.get("duration") or det.get("more_info", {}).get("duration") or 0)
+            if exp_dur > 0 and det_dur > 0 and abs(det_dur - exp_dur) > 30.0:
+                log(f"[Saavn] Disqualified candidate '{s_title}' on detailed duration check ({det_dur}s vs expected {exp_dur}s)")
+                continue
+
             enc = det.get("encrypted_media_url") or det.get("more_info", {}).get("encrypted_media_url")
             if not enc:
                 continue
@@ -485,18 +637,29 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS") -> str | No
 
             url_320 = m.group(0).replace("_96.mp4", "_320.mp4")
             audio_url = url_320
-            head = httpx.head(url_320, headers=headers, timeout=5.0)
-            if head.status_code != 200:
+            try:
+                head = httpx.head(url_320, headers=headers, timeout=5.0)
+                if head.status_code != 200:
+                    audio_url = m.group(0)
+            except Exception:
                 audio_url = m.group(0)
 
-            print(f"[Saavn] Found verified stream: '{s_title}' (Score {sc:.1f}) -> {audio_url}")
-            stream_content = httpx.get(audio_url, headers=headers, timeout=30.0).content
-            if len(stream_content) < 100000:
-                continue
-
+            log(f"[Saavn] Found verified stream: '{s_title}' (Score {sc:.1f}) -> {audio_url}")
             tmp_in = target_file + ".tmp.mp4"
-            with open(tmp_in, "wb") as f:
-                f.write(stream_content)
+
+            # Stream directly to disk in 64KB chunks to protect server RAM
+            with httpx.stream("GET", audio_url, headers=headers, timeout=45.0, follow_redirects=True) as resp:
+                if resp.status_code != 200:
+                    log(f"[Saavn] CDN stream returned status {resp.status_code}")
+                    continue
+                with open(tmp_in, "wb") as f:
+                    for chunk in resp.iter_bytes(chunk_size=65536):
+                        f.write(chunk)
+
+            if not os.path.exists(tmp_in) or os.path.getsize(tmp_in) < 100000:
+                if os.path.exists(tmp_in):
+                    os.remove(tmp_in)
+                continue
 
             # Transcode / Remux with FFmpeg
             if is_flac:
@@ -542,361 +705,368 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS") -> str | No
                     audio_id3.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes))
                 audio_id3.save(target_file)
 
-            print(f"[Saavn] Successfully generated: {target_file} ({os.path.getsize(target_file)} bytes)")
+            log(f"[Saavn] Successfully generated: {target_file} ({os.path.getsize(target_file)} bytes)")
             return target_file
         except Exception as err:
-            print(f"[Saavn] Candidate error: {err}")
+            log(f"[Saavn] Candidate error: {err}")
 
     return None
 
 
-def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool, meta=None):
+def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool, meta=None, log_list: list = None):
     """Synchronous worker function executed in an asyncio thread pool."""
     import sys
     import urllib.request
+
+    def log(msg: str):
+        print(msg, flush=True)
+        if log_list is not None:
+            log_list.append(str(msg))
+
     try:
         sys.stdout.reconfigure(encoding="utf-8")
         sys.stderr.reconfigure(encoding="utf-8")
     except Exception:
         pass
 
-    # Create and assign an isolated event loop for this background worker thread
     thread_loop = asyncio.new_event_loop()
     asyncio.set_event_loop(thread_loop)
 
-    # Ensure metadata is fully resolved
-    if meta is None:
+    try:
+        # Ensure metadata is fully resolved
+        if meta is None:
+            try:
+                client = SpotifyMetadataClient()
+                _, trs, _, _ = thread_loop.run_until_complete(client.get_url_async(url))
+                if trs:
+                    meta = trs[0]
+            except Exception as e:
+                log(f"[Worker] Metadata resolution notice: {e}")
+
+        qobuz_token = os.getenv("QOBUZ_TOKEN") or None
+        tidal_api = os.getenv("TIDAL_CUSTOM_API") or None
+
+        isrc_str = str(getattr(meta, "isrc", "") or "").strip().upper()
+        is_indian = isrc_str.startswith("IN")
+
+        # 1. Indian / Bollywood releases with Indian ISRC:
+        # Skip Western stores that return 404 and directly download via JioSaavn Studio Engine
+        if is_indian and meta:
+            log(f"[Worker] Indian release confirmed (ISRC '{isrc_str}'). Engaging JioSaavn Studio Engine...")
+            saavn_file = download_saavn(meta, output_dir, quality, log_list)
+            if saavn_file and os.path.exists(saavn_file):
+                log(f"[Worker] Cleanly retrieved track via JioSaavn Studio Engine: {os.path.basename(saavn_file)}")
+                return
+
+        # 2. Primary Quality Default: Amazon Music 24-bit Studio Master FLAC (#1 Max Quality)
+        services = ["amazon"]
+        if tidal_api:
+            services.insert(1, "tidal")
+
+        log(f"[Worker] Attempting primary studio master via {services}...")
+        import builtins
+        original_input = builtins.input
+        builtins.input = lambda *a: (_ for _ in ()).throw(EOFError("Non-interactive server execution"))
         try:
-            client = SpotifyMetadataClient()
-            _, trs, _, _ = thread_loop.run_until_complete(client.get_url_async(url))
-            if trs:
-                meta = trs[0]
+            from SpotiFLAC.downloader import DownloadOptions, SpotiflacDownloader
+            opts = DownloadOptions(
+                output_dir=output_dir,
+                services=services,
+                quality=quality,
+                embed_lyrics=False,
+                enrich_metadata=False,
+                track_max_retries=0,
+                qobuz_token=qobuz_token,
+                tidal_custom_api=tidal_api,
+                allow_fallback=False,
+                timeout_s=30,
+            )
+            dl = SpotiflacDownloader(opts)
+            thread_loop.run_until_complete(dl.run_async(url))
         except Exception as e:
-            print(f"[Worker] Metadata resolution notice: {e}")
+            log(f"[SpotiflacDownloader] Run notice: {e}")
+        finally:
+            builtins.input = original_input
 
-    qobuz_token = os.getenv("QOBUZ_TOKEN") or None
-    tidal_api = os.getenv("TIDAL_CUSTOM_API") or None
+        # Clean up any leftover incomplete part files
+        for p in glob.glob(str(Path(output_dir) / "**/*.part"), recursive=True):
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
-    isrc_str = str(getattr(meta, "isrc", "") or "").strip().upper()
-    is_indian = isrc_str.startswith("IN")
+        # Check if SpotiFLAC produced an audio file
+        downloaded = glob.glob(str(Path(output_dir) / "**/*.*"), recursive=True)
+        audio_files = [
+            f for f in downloaded
+            if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
+        ]
+        if audio_files:
+            raw_file = audio_files[0]
+            raw_ext = os.path.splitext(raw_file)[1].lower()
+            t_title = getattr(meta, "title", "Track") if meta else "Track"
+            t_artists = getattr(meta, "artists", "Artist") if meta else "Artist"
+            t_album = (getattr(meta, "album", "") if meta else "") or t_title
+            t_cover = getattr(meta, "cover_url", "") if meta else ""
+            t_year = str(getattr(meta, "release_date", ""))[:4] if meta and getattr(meta, "release_date", "") else ""
 
-    # 1. Indian / Bollywood releases with Indian ISRC:
-    # Skip Western stores that return 404 and directly download via JioSaavn Studio Engine
-    if is_indian and meta:
-        print(f"[Worker] Indian release confirmed (ISRC '{isrc_str}'). Engaging JioSaavn Studio Engine...")
-        saavn_file = download_saavn(meta, output_dir, quality)
-        if saavn_file and os.path.exists(saavn_file):
-            print(f"[Worker] Cleanly retrieved track via JioSaavn Studio Engine: {os.path.basename(saavn_file)}")
+            safe_t = re.sub(r'[\\/*?:"<>|]', "", t_title)
+            safe_a = re.sub(r'[\\/*?:"<>|]', "", t_artists)
+            expected_name = f"{safe_t} - {safe_a}{raw_ext}"
+            expected_path = os.path.join(output_dir, expected_name)
+
+            try:
+                if raw_ext == ".flac":
+                    from mutagen.flac import FLAC, Picture
+                    audio_tag = FLAC(raw_file)
+                    if not audio_tag.get("title"):
+                        audio_tag["title"] = t_title
+                    if not audio_tag.get("artist"):
+                        audio_tag["artist"] = t_artists
+                    if not audio_tag.get("album"):
+                        audio_tag["album"] = t_album
+                    if t_year and not audio_tag.get("date"):
+                        audio_tag["date"] = t_year
+                    if t_cover and not audio_tag.pictures:
+                        try:
+                            pic_data = httpx.get(t_cover, timeout=10.0).content
+                            pic = Picture()
+                            pic.type = 3
+                            pic.mime = "image/jpeg"
+                            pic.data = pic_data
+                            audio_tag.add_picture(pic)
+                        except Exception:
+                            pass
+                    audio_tag.save()
+
+                if os.path.abspath(raw_file) != os.path.abspath(expected_path):
+                    if os.path.exists(expected_path):
+                        os.remove(expected_path)
+                    os.rename(raw_file, expected_path)
+                log(f"[Worker] Cleanly normalized file: {expected_name}")
+            except Exception as norm_err:
+                log(f"[Worker] Tag normalization notice: {norm_err}")
             return
 
-    # 2. Primary Quality Default: Amazon Music 24-bit Studio Master FLAC (#1 Max Quality)
-    services = ["amazon"]
-    if tidal_api:
-        services.insert(1, "tidal")
+        # 3. JioSaavn Studio Engine Fallback (for Western releases if Amazon/mirrors were busy)
+        if meta:
+            log("[Worker] Primary lossless mirrors busy/unavailable. Engaging JioSaavn Studio Engine...")
+            saavn_file = download_saavn(meta, output_dir, quality, log_list)
+            if saavn_file and os.path.exists(saavn_file):
+                log(f"[Worker] Cleanly finished via JioSaavn Studio Engine: {os.path.basename(saavn_file)}")
+                return
 
-    # Attempt SpotiFLAC Amazon 24-bit extraction with direct native thread loop
-    import builtins
-    original_input = builtins.input
-    builtins.input = lambda *a: (_ for _ in ()).throw(EOFError("Non-interactive server execution"))
-    try:
-        from SpotiFLAC.downloader import DownloadOptions, SpotiflacDownloader
-        opts = DownloadOptions(
-            output_dir=output_dir,
-            services=services,
-            quality=quality,
-            embed_lyrics=False,
-            enrich_metadata=False,
-            track_max_retries=0,
-            qobuz_token=qobuz_token,
-            tidal_custom_api=tidal_api,
-            allow_fallback=False,
-            timeout_s=45,
-        )
-        dl = SpotiflacDownloader(opts)
-        thread_loop.run_until_complete(dl.run_async(url))
-    except Exception as e:
-        print(f"[SpotiflacDownloader] Run notice: {e}")
+        # 4. Resilient Direct Stream Fallback via YouTube with Candidate Verification
+        log("[Fallback] Engaging verified studio stream fallback...")
+        try:
+            import yt_dlp
+            from mutagen.flac import FLAC, Picture
+            from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC
+            from mutagen.mp4 import MP4, MP4Cover
+
+            title = getattr(meta, "title", "Track") if meta else "Track"
+            artists = getattr(meta, "artists", "Artist") if meta else "Artist"
+            album = (getattr(meta, "album", "") if meta else "") or title
+            cover_url = getattr(meta, "cover_url", "") if meta else ""
+            year = str(getattr(meta, "release_date", ""))[:4] if meta and getattr(meta, "release_date", "") else ""
+            expected_duration = (getattr(meta, "duration_ms", 0) or 0) / 1000.0
+
+            safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
+            safe_artist = re.sub(r'[\\/*?:"<>|]', "", artists)
+            base_filename = f"{safe_title} - {safe_artist}"
+
+            quality_str = str(quality).upper()
+            if "LOSSLESS" in quality_str or "FLAC" in quality_str:
+                target_ext = "flac"
+                postprocessor = {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "flac",
+                }
+            else:
+                target_ext = "mp3"
+                postprocessor = {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "320" if "HIGH" in quality_str else "192",
+                }
+
+            out_tmpl = os.path.join(output_dir, f"{base_filename}.%(ext)s")
+            target_file = None
+            download_success = False
+
+            flat_opts = {
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": True,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["android_creator", "tv_embedded", "mweb", "ios"]
+                    }
+                },
+            }
+
+            ydl_dl_opts = {
+                "format": "bestaudio/best",
+                "quiet": True,
+                "no_warnings": True,
+                "outtmpl": out_tmpl,
+                "postprocessors": [postprocessor],
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": ["android_creator", "tv_embedded", "mweb", "ios"]
+                    }
+                },
+            }
+
+            # Multi-query strategy for YouTube
+            search_queries = [
+                f"ytsearch5:{title} {artists} official audio",
+                f"ytsearch5:{title} {artists} topic",
+                f"ytsearch5:{artists} - {title}",
+                f"ytsearch5:{title} {artists}",
+            ]
+
+            scored_candidates = []
+            seen_ids = set()
+
+            with yt_dlp.YoutubeDL(flat_opts) as ydl_flat:
+                for q in search_queries:
+                    try:
+                        res = ydl_flat.extract_info(q, download=False)
+                        for entry in (res.get("entries") or []):
+                            if not entry:
+                                continue
+                            vid = entry.get("id")
+                            if not vid or vid in seen_ids:
+                                continue
+                            seen_ids.add(vid)
+
+                            c_title = entry.get("title") or ""
+                            c_uploader = entry.get("channel") or entry.get("uploader") or ""
+                            c_dur = float(entry.get("duration") or 0)
+                            c_url = entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
+
+                            sc, reason = score_candidate(c_title, c_uploader, c_dur, title, artists, expected_duration)
+                            log(f"[Fallback Candidate] Score {sc:5.1f}: '{c_title}' ({c_dur}s) - {reason}")
+                            if sc > 0:
+                                scored_candidates.append({
+                                    "score": sc,
+                                    "url": c_url,
+                                    "title": c_title,
+                                    "duration": c_dur,
+                                })
+                    except Exception as qe:
+                        log(f"[Fallback Search] Query error on '{q[:30]}': {qe}")
+
+            # Sort candidates descending by match score
+            scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+            for cand_info in scored_candidates[:3]:
+                try:
+                    log(f"[Fallback Download] Attempting candidate (score {cand_info['score']:.1f}): {cand_info['title']}...")
+                    with yt_dlp.YoutubeDL(ydl_dl_opts) as ydl_dl:
+                        ydl_dl.download([cand_info["url"]])
+
+                    found = [
+                        f for f in glob.glob(os.path.join(output_dir, "**/*.*"), recursive=True)
+                        if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
+                    ]
+                    if found:
+                        cand = found[0]
+                        cand_duration = 0
+                        try:
+                            import mutagen
+                            mf = mutagen.File(cand)
+                            if mf and hasattr(mf, "info") and hasattr(mf.info, "length"):
+                                cand_duration = mf.info.length
+                        except Exception:
+                            pass
+
+                        cand_size = os.path.getsize(cand)
+                        log(f"[Fallback] Downloaded: {cand} (duration: {cand_duration:.1f}s, size: {cand_size} bytes)")
+
+                        min_allowed = min(expected_duration * 0.65, 45) if expected_duration > 45 else 20
+                        if cand_duration >= min_allowed:
+                            target_file = cand
+                            download_success = True
+                            break
+                        else:
+                            log(f"[Fallback] Rejected as preview snippet ({cand_duration:.1f}s < {min_allowed:.1f}s).")
+                            try:
+                                os.remove(cand)
+                            except Exception:
+                                pass
+                except Exception as de:
+                    log(f"[Fallback Download] Failed on candidate: {de}")
+
+            # Embed official metadata and album artwork
+            if download_success and target_file and os.path.exists(target_file):
+                cover_bytes = None
+                if cover_url:
+                    try:
+                        req = urllib.request.Request(cover_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req, timeout=10) as r:
+                            cover_bytes = r.read()
+                    except Exception as ce:
+                        log(f"[Fallback] Cover art download notice: {ce}")
+
+                ext = os.path.splitext(target_file)[1].lower()
+                if ext == ".flac":
+                    try:
+                        audio = FLAC(target_file)
+                        audio["title"] = [title]
+                        audio["artist"] = [artists]
+                        audio["album"] = [album]
+                        if year:
+                            audio["date"] = [year]
+                        if cover_bytes:
+                            pic = Picture()
+                            pic.data = cover_bytes
+                            pic.type = 3
+                            pic.mime = "image/jpeg"
+                            audio.add_picture(pic)
+                        audio.save()
+                        log(f"[Fallback] Tagged FLAC: {target_file}")
+                    except Exception as te:
+                        log(f"[Fallback] FLAC tag notice: {te}")
+                elif ext == ".mp3":
+                    try:
+                        try:
+                            audio = ID3(target_file)
+                        except Exception:
+                            audio = ID3()
+                        audio.add(TIT2(encoding=3, text=title))
+                        audio.add(TPE1(encoding=3, text=artists))
+                        audio.add(TALB(encoding=3, text=album))
+                        if year:
+                            audio.add(TDRC(encoding=3, text=year))
+                        if cover_bytes:
+                            audio.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes))
+                        audio.save(target_file)
+                        log(f"[Fallback] Tagged MP3: {target_file}")
+                    except Exception as te:
+                        log(f"[Fallback] MP3 tag notice: {te}")
+                elif ext == ".m4a":
+                    try:
+                        audio = MP4(target_file)
+                        audio["\xa9nam"] = [title]
+                        audio["\xa9ART"] = [artists]
+                        audio["\xa9alb"] = [album]
+                        if year:
+                            audio["\xa9day"] = [year]
+                        if cover_bytes:
+                            audio["covr"] = [MP4Cover(cover_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
+                        audio.save()
+                        log(f"[Fallback] Tagged M4A: {target_file}")
+                    except Exception as te:
+                        log(f"[Fallback] M4A tag notice: {te}")
+        except Exception as fallback_err:
+            log(f"[Fallback] Fallback engine error: {fallback_err}")
     finally:
-        builtins.input = original_input
         try:
             thread_loop.close()
         except Exception:
             pass
-
-    # Clean up any leftover incomplete part files
-    for p in glob.glob(str(Path(output_dir) / "**/*.part"), recursive=True):
-        try:
-            os.remove(p)
-        except Exception:
-            pass
-
-    # Check if SpotiFLAC produced an audio file
-    downloaded = glob.glob(str(Path(output_dir) / "**/*.*"), recursive=True)
-    audio_files = [
-        f for f in downloaded
-        if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
-    ]
-    if audio_files:
-        raw_file = audio_files[0]
-        raw_ext = os.path.splitext(raw_file)[1].lower()
-        t_title = getattr(meta, "title", "Track") if meta else "Track"
-        t_artists = getattr(meta, "artists", "Artist") if meta else "Artist"
-        t_album = (getattr(meta, "album", "") if meta else "") or t_title
-        t_cover = getattr(meta, "cover_url", "") if meta else ""
-        t_year = str(getattr(meta, "release_date", ""))[:4] if meta and getattr(meta, "release_date", "") else ""
-
-        safe_t = re.sub(r'[\\/*?:"<>|]', "", t_title)
-        safe_a = re.sub(r'[\\/*?:"<>|]', "", t_artists)
-        expected_name = f"{safe_t} - {safe_a}{raw_ext}"
-        expected_path = os.path.join(output_dir, expected_name)
-
-        try:
-            if raw_ext == ".flac":
-                from mutagen.flac import FLAC, Picture
-                audio_tag = FLAC(raw_file)
-                if not audio_tag.get("title"):
-                    audio_tag["title"] = t_title
-                if not audio_tag.get("artist"):
-                    audio_tag["artist"] = t_artists
-                if not audio_tag.get("album"):
-                    audio_tag["album"] = t_album
-                if t_year and not audio_tag.get("date"):
-                    audio_tag["date"] = t_year
-                if t_cover and not audio_tag.pictures:
-                    try:
-                        pic_data = httpx.get(t_cover, timeout=10.0).content
-                        pic = Picture()
-                        pic.type = 3
-                        pic.mime = "image/jpeg"
-                        pic.data = pic_data
-                        audio_tag.add_picture(pic)
-                    except Exception:
-                        pass
-                audio_tag.save()
-
-            if os.path.abspath(raw_file) != os.path.abspath(expected_path):
-                if os.path.exists(expected_path):
-                    os.remove(expected_path)
-                os.rename(raw_file, expected_path)
-                print(f"[Worker] Cleanly normalized file: {expected_name}")
-        except Exception as norm_err:
-            print(f"[Worker] Tag normalization notice: {norm_err}")
-        return
-
-    # 3. JioSaavn Studio Engine Fallback (for Western releases if Amazon/mirrors were busy)
-    if meta:
-        print("[Worker] Primary lossless mirrors busy/unavailable. Engaging JioSaavn Studio Engine...")
-        saavn_file = download_saavn(meta, output_dir, quality)
-        if saavn_file and os.path.exists(saavn_file):
-            print(f"[Worker] Cleanly finished via JioSaavn Studio Engine: {os.path.basename(saavn_file)}")
-            return
-
-    # 4. Resilient Direct Stream Fallback via YouTube with Candidate Verification
-    print("[Fallback] Engaging verified studio stream fallback...")
-    try:
-        import yt_dlp
-        from mutagen.flac import FLAC, Picture
-        from mutagen.id3 import ID3, APIC, TIT2, TPE1, TALB, TDRC
-        from mutagen.mp4 import MP4, MP4Cover
-
-        title = getattr(meta, "title", "Track") if meta else "Track"
-        artists = getattr(meta, "artists", "Artist") if meta else "Artist"
-        album = (getattr(meta, "album", "") if meta else "") or title
-        cover_url = getattr(meta, "cover_url", "") if meta else ""
-        year = str(getattr(meta, "release_date", ""))[:4] if meta and getattr(meta, "release_date", "") else ""
-        expected_duration = (getattr(meta, "duration_ms", 0) or 0) / 1000.0
-
-        safe_title = re.sub(r'[\\/*?:"<>|]', "", title)
-        safe_artist = re.sub(r'[\\/*?:"<>|]', "", artists)
-        base_filename = f"{safe_title} - {safe_artist}"
-
-        quality_str = str(quality).upper()
-        if "LOSSLESS" in quality_str or "FLAC" in quality_str:
-            target_ext = "flac"
-            postprocessor = {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "flac",
-            }
-        else:
-            target_ext = "mp3"
-            postprocessor = {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "320" if "HIGH" in quality_str else "192",
-            }
-
-        out_tmpl = os.path.join(output_dir, f"{base_filename}.%(ext)s")
-        target_file = None
-        download_success = False
-
-        flat_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "extract_flat": True,
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["ios", "mweb", "tv_embedded"]
-                }
-            },
-        }
-
-        ydl_dl_opts = {
-            "format": "bestaudio/best",
-            "quiet": True,
-            "no_warnings": True,
-            "outtmpl": out_tmpl,
-            "postprocessors": [postprocessor],
-            "extractor_args": {
-                "youtube": {
-                    "player_client": ["ios", "mweb", "tv_embedded"]
-                }
-            },
-        }
-
-        # Multi-query strategy for YouTube
-        search_queries = [
-            f"ytsearch5:{title} {artists} official audio",
-            f"ytsearch5:{title} {artists} topic",
-            f"ytsearch5:{artists} - {title}",
-            f"ytsearch5:{title} {artists}",
-        ]
-
-        scored_candidates = []
-        seen_ids = set()
-
-        with yt_dlp.YoutubeDL(flat_opts) as ydl_flat:
-            for q in search_queries:
-                try:
-                    res = ydl_flat.extract_info(q, download=False)
-                    for entry in (res.get("entries") or []):
-                        if not entry:
-                            continue
-                        vid = entry.get("id")
-                        if not vid or vid in seen_ids:
-                            continue
-                        seen_ids.add(vid)
-
-                        c_title = entry.get("title") or ""
-                        c_uploader = entry.get("channel") or entry.get("uploader") or ""
-                        c_dur = float(entry.get("duration") or 0)
-                        c_url = entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={vid}"
-
-                        sc, reason = score_candidate(c_title, c_uploader, c_dur, title, artists, expected_duration)
-                        print(f"[Fallback Candidate] Score {sc:5.1f}: '{c_title}' ({c_dur}s) - {reason}")
-                        if sc > 0:
-                            scored_candidates.append({
-                                "score": sc,
-                                "url": c_url,
-                                "title": c_title,
-                                "duration": c_dur,
-                            })
-                except Exception as qe:
-                    print(f"[Fallback Search] Query error on '{q[:30]}': {qe}")
-
-        # Sort candidates descending by match score
-        scored_candidates.sort(key=lambda x: x["score"], reverse=True)
-
-        for cand_info in scored_candidates[:3]:
-            try:
-                print(f"[Fallback Download] Attempting candidate (score {cand_info['score']:.1f}): {cand_info['title']}...")
-                with yt_dlp.YoutubeDL(ydl_dl_opts) as ydl_dl:
-                    ydl_dl.download([cand_info["url"]])
-
-                found = [
-                    f for f in glob.glob(os.path.join(output_dir, "**/*.*"), recursive=True)
-                    if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
-                ]
-                if found:
-                    cand = found[0]
-                    cand_duration = 0
-                    try:
-                        import mutagen
-                        mf = mutagen.File(cand)
-                        if mf and hasattr(mf, "info") and hasattr(mf.info, "length"):
-                            cand_duration = mf.info.length
-                    except Exception:
-                        pass
-
-                    cand_size = os.path.getsize(cand)
-                    print(f"[Fallback] Downloaded: {cand} (duration: {cand_duration:.1f}s, size: {cand_size} bytes)")
-
-                    min_allowed = min(expected_duration * 0.65, 45) if expected_duration > 45 else 20
-                    if cand_duration >= min_allowed:
-                        target_file = cand
-                        download_success = True
-                        break
-                    else:
-                        print(f"[Fallback] Rejected as preview snippet ({cand_duration:.1f}s < {min_allowed:.1f}s).")
-                        try:
-                            os.remove(cand)
-                        except Exception:
-                            pass
-            except Exception as de:
-                print(f"[Fallback Download] Failed on candidate: {de}")
-
-        # Embed official metadata and album artwork
-        if download_success and target_file and os.path.exists(target_file):
-            cover_bytes = None
-            if cover_url:
-                try:
-                    req = urllib.request.Request(cover_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req, timeout=10) as r:
-                        cover_bytes = r.read()
-                except Exception as ce:
-                    print(f"[Fallback] Cover art download notice: {ce}")
-
-            ext = os.path.splitext(target_file)[1].lower()
-            if ext == ".flac":
-                try:
-                    audio = FLAC(target_file)
-                    audio["title"] = [title]
-                    audio["artist"] = [artists]
-                    audio["album"] = [album]
-                    if year:
-                        audio["date"] = [year]
-                    if cover_bytes:
-                        pic = Picture()
-                        pic.data = cover_bytes
-                        pic.type = 3
-                        pic.mime = "image/jpeg"
-                        audio.add_picture(pic)
-                    audio.save()
-                    print(f"[Fallback] Tagged FLAC: {target_file}")
-                except Exception as te:
-                    print(f"[Fallback] FLAC tag notice: {te}")
-            elif ext == ".mp3":
-                try:
-                    try:
-                        audio = ID3(target_file)
-                    except Exception:
-                        audio = ID3()
-                    audio.add(TIT2(encoding=3, text=title))
-                    audio.add(TPE1(encoding=3, text=artists))
-                    audio.add(TALB(encoding=3, text=album))
-                    if year:
-                        audio.add(TDRC(encoding=3, text=year))
-                    if cover_bytes:
-                        audio.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes))
-                    audio.save(target_file)
-                    print(f"[Fallback] Tagged MP3: {target_file}")
-                except Exception as te:
-                    print(f"[Fallback] MP3 tag notice: {te}")
-            elif ext == ".m4a":
-                try:
-                    audio = MP4(target_file)
-                    audio["\xa9nam"] = [title]
-                    audio["\xa9ART"] = [artists]
-                    audio["\xa9alb"] = [album]
-                    if year:
-                        audio["\xa9day"] = [year]
-                    if cover_bytes:
-                        audio["covr"] = [MP4Cover(cover_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
-                    audio.save()
-                    print(f"[Fallback] Tagged M4A: {target_file}")
-                except Exception as te:
-                    print(f"[Fallback] M4A tag notice: {te}")
-    except Exception as fallback_err:
-        print(f"[Fallback] Fallback engine error: {fallback_err}")
 
 
 
