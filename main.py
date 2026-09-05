@@ -718,11 +718,11 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS", log_list: l
                     os.remove(tmp_in)
                 continue
 
-            # Transcode / Remux with FFmpeg using turbo lossless encoding (-compression_level 1 -threads 0)
+            # Transcode / Remux with FFmpeg using memory-efficient turbo encoding (-compression_level 1 -threads 1)
             if is_flac:
-                cmd = ["ffmpeg", "-y", "-i", tmp_in, "-c:a", "flac", "-compression_level", "1", "-threads", "0", target_file]
+                cmd = ["ffmpeg", "-y", "-i", tmp_in, "-c:a", "flac", "-compression_level", "1", "-threads", "1", target_file]
             else:
-                cmd = ["ffmpeg", "-y", "-i", tmp_in, "-c:a", "libmp3lame", "-b:a", "320k", "-threads", "0", target_file]
+                cmd = ["ffmpeg", "-y", "-i", tmp_in, "-c:a", "libmp3lame", "-b:a", "320k", "-threads", "1", target_file]
 
             subprocess.run(cmd, capture_output=True, check=True)
             if os.path.exists(tmp_in):
@@ -797,6 +797,17 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
             except Exception as e:
                 log(f"[Worker] Metadata resolution notice: {e}")
 
+        # If ISRC is not populated, resolve it now to enable instant regional routing
+        if meta and not getattr(meta, "isrc", ""):
+            try:
+                from SpotiFLAC.core.isrc_helper import IsrcHelper
+                from SpotiFLAC.core.http import AsyncHttpClient
+                helper = IsrcHelper(AsyncHttpClient("isrc"))
+                meta.isrc = thread_loop.run_until_complete(helper.get_isrc_async(meta.id))
+                log(f"[Worker] Resolved ISRC: '{meta.isrc}'")
+            except Exception as e:
+                log(f"[Worker] ISRC resolution notice: {e}")
+
         qobuz_token = os.getenv("QOBUZ_TOKEN") or None
         tidal_api = os.getenv("TIDAL_CUSTOM_API") or None
 
@@ -833,7 +844,7 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
                 qobuz_token=qobuz_token,
                 tidal_custom_api=tidal_api,
                 allow_fallback=False,
-                timeout_s=10,
+                timeout_s=45,
             )
             dl = SpotiflacDownloader(opts)
             thread_loop.run_until_complete(dl.run_async(url))
@@ -1440,7 +1451,7 @@ async def run_drive_job(
             print(f"[DriveJob {job_id[:8]}] Folder init failed: {fe}")
             return
 
-        sem = asyncio.Semaphore(3)
+        sem = asyncio.Semaphore(2)
         job_lock = asyncio.Lock()
 
         async def process_track(idx: int, tr):
