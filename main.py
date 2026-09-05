@@ -25,15 +25,15 @@ keep_alive_task = None
 async def run_keep_alive(url: str, interval_minutes: int = 14):
     """Periodically ping self to keep Render free tier awake."""
     ping_url = f"{url.rstrip('/')}/api/health"
-    print(f"⏱️ [Keep-Alive] Started: Pinging {ping_url} every {interval_minutes} minutes.")
+    print(f"[Keep-Alive] Started: Pinging {ping_url} every {interval_minutes} minutes.")
     async with httpx.AsyncClient(timeout=10.0) as client:
         while True:
             await asyncio.sleep(interval_minutes * 60)
             try:
                 res = await client.get(ping_url)
-                print(f"💓 [Keep-Alive] Ping {ping_url} -> Status {res.status_code}")
+                print(f"[Keep-Alive] Ping {ping_url} -> Status {res.status_code}")
             except Exception as e:
-                print(f"❌ [Keep-Alive] Ping failed: {e}")
+                print(f"[Keep-Alive] Ping failed: {e}")
 
 
 @asynccontextmanager
@@ -43,7 +43,7 @@ async def lifespan(app: FastAPI):
     if external_url:
         keep_alive_task = asyncio.create_task(run_keep_alive(external_url))
     else:
-        print("ℹ️ [Keep-Alive] No external URL configured. Skipping self-ping.")
+        print("[Keep-Alive] No external URL configured. Skipping self-ping.")
 
     yield
 
@@ -75,9 +75,9 @@ def cleanup_directory(dir_path: str):
     try:
         if os.path.exists(dir_path):
             shutil.rmtree(dir_path, ignore_errors=True)
-            print(f"🧹 Cleaned up temporary directory: {dir_path}")
+            print(f"[Cleanup] Removed temporary directory: {dir_path}")
     except Exception as e:
-        print(f"⚠️ Error removing directory {dir_path}: {e}")
+        print(f"[Cleanup] Error removing directory {dir_path}: {e}")
 
 
 @app.get("/api/health")
