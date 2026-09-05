@@ -93,7 +93,7 @@ def cleanup_directory(dir_path: str):
 @app.get("/api/health")
 def health_check():
     """Health check endpoint used by Render and external uptime monitors."""
-    return {"status": "ok", "service": "spotiflac-backend"}
+    return {"status": "ok", "service": "spotiflac-backend", "version": "2.0.0"}
 
 
 @app.get("/api/info")
@@ -127,9 +127,9 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
     tidal_api = os.getenv("TIDAL_CUSTOM_API") or None
 
     # Multi-provider fallback chain:
-    # 1. Qobuz & Deezer (Lossless FLAC)
-    # 2. YouTube Music (High-bitrate M4A/Opus) & SoundCloud as reliable fallbacks
-    services = ["qobuz", "deezer", "youtube", "soundcloud", "amazon"]
+    # 1. YouTube Music (256k) & SoundCloud for high reliability & speed
+    # 2. Qobuz & Deezer (Lossless FLAC)
+    services = ["youtube", "soundcloud", "qobuz", "deezer", "amazon"]
     if tidal_api:
         services.insert(0, "tidal")
 
@@ -139,6 +139,7 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
         services=services,
         quality=quality,
         embed_lyrics=embed_lyrics,
+        enrich_metadata=False,
         qobuz_token=qobuz_token,
         tidal_custom_api=tidal_api,
         allow_fallback=True,
