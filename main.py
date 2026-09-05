@@ -234,31 +234,51 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
         base_filename = f"{safe_title} - {safe_artist}"
         out_tmpl = os.path.join(output_dir, f"{base_filename}.%(ext)s")
 
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "quiet": True,
-            "no_warnings": True,
-            "outtmpl": out_tmpl,
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "m4a",
-                    "preferredquality": "256",
+        # Try multi-platform direct audio extraction (YouTube Android player & SoundCloud)
+        download_success = False
+        fallback_queries = [
+            f"ytsearch1:{title} {artists} official audio",
+            f"scsearch1:{title} {artists}",
+        ]
+
+        for query_str in fallback_queries:
+            try:
+                print(f"[Fallback] Querying audio stream via: {query_str[:30]}...")
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "quiet": True,
+                    "no_warnings": True,
+                    "outtmpl": out_tmpl,
+                    "extractor_args": {
+                        "youtube": [
+                            "player_client=android,ios",
+                            "player_skip=webpage,configs,js",
+                        ]
+                    },
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "m4a",
+                            "preferredquality": "256",
+                        }
+                    ],
                 }
-            ],
-            "default_search": "ytsearch1",
-        }
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([f"ytsearch1:{title} {artists} official audio"])
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([query_str])
 
-        target_m4a = os.path.join(output_dir, f"{base_filename}.m4a")
-        if not os.path.exists(target_m4a):
-            candidates = glob.glob(os.path.join(output_dir, f"{base_filename}.*"))
-            if candidates:
-                target_m4a = candidates[0]
+                candidates = [
+                    f for f in glob.glob(os.path.join(output_dir, "**/*.*"), recursive=True)
+                    if f.lower().endswith(('.m4a', '.mp3', '.flac', '.wav', '.ogg', '.opus'))
+                ]
+                if candidates and os.path.getsize(candidates[0]) > 50000:
+                    target_m4a = candidates[0]
+                    download_success = True
+                    break
+            except Exception as fe:
+                print(f"[Fallback] {query_str[:20]} attempt error: {fe}")
 
-        if os.path.exists(target_m4a) and target_m4a.endswith(".m4a"):
+        if download_success and os.path.exists(target_m4a):
             try:
                 audio = MP4(target_m4a)
                 audio["\xa9nam"] = [title]
