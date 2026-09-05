@@ -1,11 +1,12 @@
 FROM python:3.12-slim
 
-# Install system dependencies: FFmpeg, Node.js (for extension bridges), and curl
+# Install system dependencies: FFmpeg, Node.js (for extension bridges), curl, and openssl
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     ffmpeg \
     nodejs \
-    curl && \
+    curl \
+    openssl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -23,8 +24,8 @@ ENV PYTHONIOENCODING=utf-8
 ENV PYTHONUTF8=1
 ENV SPOTIFLAC_REGISTRIES="https://raw.githubusercontent.com/zarzet/SpotiFLAC-Extension/main/registry.json"
 
-# Pre-install all SpotiFLAC audio provider extensions into container image
-RUN python -c "from SpotiFLAC.extensions import ExtensionManager; em = ExtensionManager(); em.ensure_download_providers(); print('Pre-installed extensions:', [e.name for e in em.list_installed()])"
+# Pre-install SpotiFLAC audio provider extensions into container image (purge soundcloud)
+RUN python -c "from SpotiFLAC.extensions import ExtensionManager; em = ExtensionManager(); em.ensure_download_providers(); (em.uninstall('soundcloud') if em.get_installed('soundcloud') else None); print('Pre-installed extensions:', [e.name for e in em.list_installed()])"
 
 ENV PORT=8000
 EXPOSE $PORT

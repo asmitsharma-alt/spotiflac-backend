@@ -4,3 +4,4 @@ SpotiFLAC>=1.4.4
 mutagen>=1.47.0
 python-dotenv>=1.0.0
 yt-dlp>=2024.08.06
+pycryptodome>=3.20.0
