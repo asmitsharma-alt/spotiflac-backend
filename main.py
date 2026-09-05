@@ -251,6 +251,41 @@ def probe_saavn(q: str = Query("I Wanna Be Yours", description="Search query")):
     return results
 
 
+@app.get("/api/probe-yt")
+def probe_yt(q: str = Query("Arctic Monkeys I Wanna Be Yours", description="Search query")):
+    """Diagnostic endpoint to inspect YouTube search & stream capabilities directly from the container."""
+    import yt_dlp
+    flat_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android_creator", "tv_embedded", "mweb", "ios"]
+            }
+        },
+    }
+    with yt_dlp.YoutubeDL(flat_opts) as ydl:
+        try:
+            res = ydl.extract_info(f"ytsearch3:{q}", download=False)
+            entries = res.get("entries") or []
+            return {
+                "status": "ok",
+                "count": len(entries),
+                "entries": [
+                    {
+                        "id": e.get("id"),
+                        "title": e.get("title"),
+                        "uploader": e.get("channel") or e.get("uploader"),
+                        "duration": e.get("duration"),
+                    }
+                    for e in entries if e
+                ]
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+
 @app.get("/api/info")
 async def get_track_info(
     url: str = Query(..., description="Spotify URL (track, album, playlist, or artist)")
@@ -421,11 +456,17 @@ def score_saavn_candidate(
         'slower', 'faster', 'cover', 'tribute', 'karaoke', 'instrumental', 'acoustic',
         'edit audio', 'edit)', 'tik tok', 'tiktok', 'nightcore', 'daycore', 'chopped',
         'bass boosted', '8d audio', '8d', 'techno', 'house mix', 'club mix', 'trap mix',
-        'lofi', 'lo-fi', 'drill', 'tribute band', 'orchestral'
+        'lofi', 'lo-fi', 'drill', 'tribute band', 'orchestral', 'chill', 'chill house',
+        'house version', 'dance version', 'karaoke version', 'instrumental version',
+        'tribute to', 'made famous by', 'in the style of', 'remake'
     ]
     for b in banned:
         if b in t_cand and b not in t_exp:
             return -1000.0
+
+    # Reject covers that put '(by Arctic Monkeys)' in the title
+    if "(by " in t_cand and "(by " not in t_exp:
+        return -1000.0
 
     # Reject mashups / versus unless explicitly in expected metadata
     if any(delim in t_cand for delim in [" x ", " X ", " vs ", " vs. ", " / "]):
@@ -439,11 +480,11 @@ def score_saavn_candidate(
         if len(matched) / len(words) < 0.65:
             return -500.0
 
-    # Primary artist match (CRITICAL: prevents downloading covers or wrong versions)
+    # Primary artist match (CRITICAL: artist MUST appear in cand_artist, NOT just candidate title)
     artist_words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', a_exp) if len(w) > 2]
-    artist_found = (a_exp in a_cand or a_exp in t_cand)
+    artist_found = (a_exp in a_cand)
     if not artist_found and artist_words:
-        artist_found = all(w in a_cand or w in t_cand for w in artist_words)
+        artist_found = all(w in a_cand for w in artist_words)
 
     if not artist_found:
         return -400.0
