@@ -344,26 +344,48 @@ def score_saavn_candidate(
     t_exp = re.sub(r'\s*[\(\[].*?[\)\]]', '', (exp_title or "").lower()).strip()
     a_exp = re.split(r'[,&/]', (exp_artist or "").lower())[0].strip()
 
-    banned = ['mashup', 'remix', 'slowed', 'reverb', 'sped up', 'cover', 'tribute', 'karaoke', 'instrumental']
+    banned = [
+        'mashup', 'mash up', 'remix', 'slowed', 'reverb', 'sped up', 'speed up', 'speedup',
+        'slower', 'faster', 'cover', 'tribute', 'karaoke', 'instrumental', 'acoustic',
+        'edit audio', 'edit)', 'tik tok', 'tiktok', 'nightcore', 'daycore', 'chopped',
+        'bass boosted', '8d audio', '8d', 'techno', 'house mix', 'club mix', 'trap mix',
+        'lofi', 'lo-fi', 'drill', 'tribute band', 'orchestral'
+    ]
     for b in banned:
         if b in t_cand and b not in t_exp:
-            return -100.0
+            return -1000.0
 
-    words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', t_exp) if len(w) >= 3]
+    # Reject mashups / versus unless explicitly in expected metadata
+    if any(delim in t_cand for delim in [" x ", " X ", " vs ", " vs. ", " / "]):
+        if not any(delim in t_exp or delim in (exp_artist or "").lower() for delim in [" x ", " X ", " vs ", " vs. "]):
+            return -1000.0
+
+    # Title word match
+    words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', t_exp) if len(w) >= 3 or w in ('be', 'me', 'we', 'go', 'do', 'no')]
     if words:
         matched = [w for w in words if w in t_cand]
-        if len(matched) / len(words) < 0.6:
-            return -50.0
+        if len(matched) / len(words) < 0.65:
+            return -500.0
 
-    score = 100.0
-    if a_exp in a_cand or a_exp in t_cand:
-        score += 30.0
+    # Primary artist match (CRITICAL: prevents downloading covers or wrong versions)
+    artist_words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', a_exp) if len(w) > 2]
+    artist_found = (a_exp in a_cand or a_exp in t_cand)
+    if not artist_found and artist_words:
+        artist_found = all(w in a_cand or w in t_cand for w in artist_words)
 
+    if not artist_found:
+        return -400.0
+
+    # Duration match
+    diff = 0.0
     if exp_duration > 0 and cand_duration > 0:
         diff = abs(cand_duration - exp_duration)
-        if diff > 40.0:
-            return -50.0
-        score -= diff * 1.5
+        if diff > 30.0:
+            return -300.0
+
+    score = 100.0 - (diff * 2.0)
+    if a_exp in a_cand:
+        score += 30.0
 
     sim = difflib.SequenceMatcher(None, f"{t_exp} {a_exp}", f"{t_cand} {a_cand}").ratio()
     score += sim * 20.0
@@ -396,7 +418,7 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS") -> str | No
     target_ext = ".flac" if is_flac else ".mp3"
     target_file = os.path.join(output_dir, f"{clean_t} - {clean_a}{target_ext}")
 
-    queries = [f"{title} {artists}", title]
+    queries = [f"{title} {artists}", f"{artists} {title}", title]
     candidates = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -411,7 +433,7 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS") -> str | No
                     "ctx": "android",
                     "_format": "json",
                     "p": "1",
-                    "n": "5",
+                    "n": "10",
                 },
                 headers=headers,
                 timeout=8.0
@@ -424,7 +446,7 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS") -> str | No
                     s_artist = item.get("singers", "")
                     s_dur = float(item.get("duration", 0) or 0)
                     sc = score_saavn_candidate(s_title, s_artist, s_dur, title, artists, exp_dur)
-                    if sc > 0:
+                    if sc > 50:
                         candidates.append((sc, pid, s_title))
                 if candidates:
                     break
