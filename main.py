@@ -313,12 +313,19 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
     qobuz_token = os.getenv("QOBUZ_TOKEN") or None
     tidal_api = os.getenv("TIDAL_CUSTOM_API") or None
 
-    # Lossless services (SoundCloud explicitly removed per user requirement)
-    services = ["youtube", "qobuz", "deezer", "amazon"]
+    # Quality-prioritized provider chain:
+    # 1. Amazon Music: True 24-bit Studio Master Lossless FLAC (~1486 kbps, 34MB)
+    # 2. Qobuz / Tidal: 24-bit / 16-bit Hi-Res Lossless FLAC
+    # 3. Deezer: 16-bit Lossless FLAC
+    # 4. YouTube Music: 48kHz / 258kbps High-Bitrate AAC LC
+    services = ["amazon", "qobuz", "deezer", "youtube"]
     if tidal_api:
-        services.insert(0, "tidal")
+        services.insert(1, "tidal")
 
-    # 1. Attempt SpotiFLAC multi-service extraction
+    # 1. Attempt SpotiFLAC multi-service extraction with non-interactive safety
+    import builtins
+    original_input = builtins.input
+    builtins.input = lambda *a: (_ for _ in ()).throw(EOFError("Non-interactive server execution"))
     try:
         SpotiFLAC(
             url=url,
@@ -330,10 +337,19 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
             qobuz_token=qobuz_token,
             tidal_custom_api=tidal_api,
             allow_fallback=True,
-            timeout_s=60,
+            timeout_s=75,
         )
     except Exception as e:
         print(f"[SpotiFLAC] Primary run notice: {e}")
+    finally:
+        builtins.input = original_input
+
+    # Clean up any leftover incomplete part files
+    for p in glob.glob(str(Path(output_dir) / "**/*.part"), recursive=True):
+        try:
+            os.remove(p)
+        except Exception:
+            pass
 
     # Check if SpotiFLAC produced an audio file
     downloaded = glob.glob(str(Path(output_dir) / "**/*.*"), recursive=True)
@@ -342,6 +358,51 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
         if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
     ]
     if audio_files:
+        # If the file came from raw extraction (e.g. Amazon Antra B00...flac), ensure tags & filename are pristine
+        raw_file = audio_files[0]
+        raw_ext = os.path.splitext(raw_file)[1].lower()
+        t_title = getattr(meta, "title", "Track") if meta else "Track"
+        t_artists = getattr(meta, "artists", "Artist") if meta else "Artist"
+        t_album = (getattr(meta, "album", "") if meta else "") or t_title
+        t_cover = getattr(meta, "cover_url", "") if meta else ""
+        t_year = str(getattr(meta, "release_date", ""))[:4] if meta and getattr(meta, "release_date", "") else ""
+
+        safe_t = re.sub(r'[\\/*?:"<>|]', "", t_title)
+        safe_a = re.sub(r'[\\/*?:"<>|]', "", t_artists)
+        expected_name = f"{safe_t} - {safe_a}{raw_ext}"
+        expected_path = os.path.join(output_dir, expected_name)
+
+        try:
+            if raw_ext == ".flac":
+                from mutagen.flac import FLAC, Picture
+                audio_tag = FLAC(raw_file)
+                if not audio_tag.get("title"):
+                    audio_tag["title"] = t_title
+                if not audio_tag.get("artist"):
+                    audio_tag["artist"] = t_artists
+                if not audio_tag.get("album"):
+                    audio_tag["album"] = t_album
+                if t_year and not audio_tag.get("date"):
+                    audio_tag["date"] = t_year
+                if t_cover and not audio_tag.pictures:
+                    try:
+                        pic_data = httpx.get(t_cover, timeout=10.0).content
+                        pic = Picture()
+                        pic.type = 3
+                        pic.mime = "image/jpeg"
+                        pic.data = pic_data
+                        audio_tag.add_picture(pic)
+                    except Exception:
+                        pass
+                audio_tag.save()
+
+            if os.path.abspath(raw_file) != os.path.abspath(expected_path):
+                if os.path.exists(expected_path):
+                    os.remove(expected_path)
+                os.rename(raw_file, expected_path)
+                print(f"[Worker] Cleanly normalized file: {expected_name}")
+        except Exception as norm_err:
+            print(f"[Worker] Tag normalization notice: {norm_err}")
         return
 
     # 2. Resilient Direct Stream Fallback via YouTube with Candidate Verification
