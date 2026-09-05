@@ -691,13 +691,26 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS", log_list: l
             log(f"[Saavn] Found verified stream: '{s_title}' (Score {sc:.1f}) -> {audio_url}")
             tmp_in = target_file + ".tmp.mp4"
 
-            # Stream directly to disk in 64KB chunks to protect server RAM
+            # Pre-fetch cover artwork concurrently in background thread while audio streams
+            cover_thread = None
+            cover_container = []
+            if cover_url:
+                import threading
+                def _fetch_cover():
+                    try:
+                        cover_container.append(httpx.get(cover_url, timeout=10.0).content)
+                    except Exception:
+                        pass
+                cover_thread = threading.Thread(target=_fetch_cover, daemon=True)
+                cover_thread.start()
+
+            # Stream directly to disk in 256KB chunks to maximize network I/O throughput
             with httpx.stream("GET", audio_url, headers=headers, timeout=45.0, follow_redirects=True) as resp:
                 if resp.status_code != 200:
                     log(f"[Saavn] CDN stream returned status {resp.status_code}")
                     continue
                 with open(tmp_in, "wb") as f:
-                    for chunk in resp.iter_bytes(chunk_size=65536):
+                    for chunk in resp.iter_bytes(chunk_size=262144):
                         f.write(chunk)
 
             if not os.path.exists(tmp_in) or os.path.getsize(tmp_in) < 100000:
@@ -705,23 +718,20 @@ def download_saavn(meta, output_dir: str, quality: str = "LOSSLESS", log_list: l
                     os.remove(tmp_in)
                 continue
 
-            # Transcode / Remux with FFmpeg
+            # Transcode / Remux with FFmpeg using turbo lossless encoding (-compression_level 1 -threads 0)
             if is_flac:
-                cmd = ["ffmpeg", "-y", "-i", tmp_in, "-c:a", "flac", target_file]
+                cmd = ["ffmpeg", "-y", "-i", tmp_in, "-c:a", "flac", "-compression_level", "1", "-threads", "0", target_file]
             else:
-                cmd = ["ffmpeg", "-y", "-i", tmp_in, "-c:a", "libmp3lame", "-b:a", "320k", target_file]
+                cmd = ["ffmpeg", "-y", "-i", tmp_in, "-c:a", "libmp3lame", "-b:a", "320k", "-threads", "0", target_file]
 
             subprocess.run(cmd, capture_output=True, check=True)
             if os.path.exists(tmp_in):
                 os.remove(tmp_in)
 
-            # Fetch Spotify album artwork
-            cover_bytes = None
-            if cover_url:
-                try:
-                    cover_bytes = httpx.get(cover_url, timeout=10.0).content
-                except Exception:
-                    pass
+            # Wait for background cover art download if still in progress
+            if cover_thread and cover_thread.is_alive():
+                cover_thread.join(timeout=3.0)
+            cover_bytes = cover_container[0] if cover_container else None
 
             # Tag normalized file
             if is_flac:
@@ -823,7 +833,7 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
                 qobuz_token=qobuz_token,
                 tidal_custom_api=tidal_api,
                 allow_fallback=False,
-                timeout_s=30,
+                timeout_s=10,
             )
             dl = SpotiflacDownloader(opts)
             thread_loop.run_until_complete(dl.run_async(url))
@@ -1430,86 +1440,98 @@ async def run_drive_job(
             print(f"[DriveJob {job_id[:8]}] Folder init failed: {fe}")
             return
 
-        for idx, tr in enumerate(tracks):
+        sem = asyncio.Semaphore(3)
+        job_lock = asyncio.Lock()
+
+        async def process_track(idx: int, tr):
             track_title = tr.title
             track_artists = tr.artists
             track_url = tr.external_url or f"https://open.spotify.com/track/{tr.id}"
 
-            job["current_track_title"] = f"{track_title} - {track_artists}"
-            job["current_track_index"] = idx + 1
-            job["updated_at"] = time.time()
+            async with sem:
+                async with job_lock:
+                    job["current_track_title"] = f"{track_title} - {track_artists}"
+                    job["current_track_index"] = idx + 1
+                    job["updated_at"] = time.time()
 
-            track_dir = TEMP_DIR / f"{job_id}_{idx}"
-            track_dir.mkdir(parents=True, exist_ok=True)
+                track_dir = TEMP_DIR / f"{job_id}_{idx}"
+                track_dir.mkdir(parents=True, exist_ok=True)
 
-            try:
-                print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Processing: {track_title}...")
-                await asyncio.to_thread(
-                    _download_worker,
-                    track_url,
-                    str(track_dir),
-                    quality,
-                    embed_lyrics,
-                    meta=tr
-                )
+                try:
+                    print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Processing (parallel): {track_title}...")
+                    await asyncio.to_thread(
+                        _download_worker,
+                        track_url,
+                        str(track_dir),
+                        quality,
+                        embed_lyrics,
+                        meta=tr
+                    )
 
-                downloaded_files = glob.glob(str(track_dir / "**/*.*"), recursive=True)
-                audio_files = [
-                    f for f in downloaded_files
-                    if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
-                ]
+                    downloaded_files = glob.glob(str(track_dir / "**/*.*"), recursive=True)
+                    audio_files = [
+                        f for f in downloaded_files
+                        if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
+                    ]
 
-                if not audio_files:
-                    raise Exception("Audio stream could not be extracted from providers.")
+                    if not audio_files:
+                        raise Exception("Audio stream could not be extracted from providers.")
 
-                file_path = audio_files[0]
-                filename = os.path.basename(file_path)
-                ext = os.path.splitext(filename)[1].lower()
-                media_types = {
-                    ".flac": "audio/flac",
-                    ".mp3": "audio/mpeg",
-                    ".m4a": "audio/mp4",
-                    ".wav": "audio/wav",
-                    ".ogg": "audio/ogg",
-                    ".opus": "audio/opus",
-                }
-                mime_type = media_types.get(ext, "application/octet-stream")
+                    file_path = audio_files[0]
+                    filename = os.path.basename(file_path)
+                    ext = os.path.splitext(filename)[1].lower()
+                    media_types = {
+                        ".flac": "audio/flac",
+                        ".mp3": "audio/mpeg",
+                        ".m4a": "audio/mp4",
+                        ".wav": "audio/wav",
+                        ".ogg": "audio/ogg",
+                        ".opus": "audio/opus",
+                    }
+                    mime_type = media_types.get(ext, "application/octet-stream")
 
-                drive_file = await upload_file_to_drive(
-                    client,
-                    access_token,
-                    file_path,
-                    filename,
-                    mime_type,
-                    target_folder_id
-                )
+                    drive_file = await upload_file_to_drive(
+                        client,
+                        access_token,
+                        file_path,
+                        filename,
+                        mime_type,
+                        target_folder_id
+                    )
 
-                file_id = drive_file.get("id")
-                web_link = drive_file.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+                    file_id = drive_file.get("id")
+                    web_link = drive_file.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
 
-                job["items"].append({
-                    "title": track_title,
-                    "artists": track_artists,
-                    "status": "completed",
-                    "file_name": filename,
-                    "file_id": file_id,
-                    "web_view_link": web_link,
-                    "size": drive_file.get("size"),
-                })
-                job["completed_tracks"] += 1
-                print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Uploaded to Drive: {filename}")
-            except Exception as item_err:
-                print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Error: {item_err}")
-                job["items"].append({
-                    "title": track_title,
-                    "artists": track_artists,
-                    "status": "failed",
-                    "error": str(item_err),
-                })
-                job["failed_tracks"] += 1
-            finally:
-                cleanup_directory(str(track_dir))
-                job["updated_at"] = time.time()
+                    async with job_lock:
+                        job["items"].append({
+                            "title": track_title,
+                            "artists": track_artists,
+                            "status": "completed",
+                            "file_name": filename,
+                            "file_id": file_id,
+                            "web_view_link": web_link,
+                            "size": drive_file.get("size"),
+                        })
+                        job["completed_tracks"] += 1
+                        job["updated_at"] = time.time()
+                    print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Uploaded to Drive: {filename}")
+                except Exception as item_err:
+                    print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Error: {item_err}")
+                    async with job_lock:
+                        job["items"].append({
+                            "title": track_title,
+                            "artists": track_artists,
+                            "status": "failed",
+                            "error": str(item_err),
+                        })
+                        job["failed_tracks"] += 1
+                        job["updated_at"] = time.time()
+                finally:
+                    cleanup_directory(str(track_dir))
+
+        # Run track processing in parallel with bounded concurrency (3 concurrent workers)
+        tasks = [process_track(idx, tr) for idx, tr in enumerate(tracks)]
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     if job["completed_tracks"] > 0:
         job["status"] = "completed"
