@@ -17,10 +17,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application source code
 COPY . .
 
-# Ensure UTF-8 output encoding to prevent logging crashes
+# Ensure UTF-8 output encoding and SpotiFLAC extension registry
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONIOENCODING=utf-8
 ENV PYTHONUTF8=1
+ENV SPOTIFLAC_REGISTRIES="https://raw.githubusercontent.com/zarzet/SpotiFLAC-Extension/main/registry.json"
+
+# Pre-install all SpotiFLAC audio provider extensions into container image
+RUN python -c "from SpotiFLAC.extensions import ExtensionManager; em = ExtensionManager(); em.ensure_download_providers(); print('Pre-installed extensions:', [e.name for e in em.list_installed()])"
 
 ENV PORT=8000
 EXPOSE $PORT

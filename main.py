@@ -15,6 +15,10 @@ from SpotiFLAC import SpotiFLAC, SpotifyMetadataClient
 
 # Load environment variables
 load_dotenv()
+os.environ.setdefault(
+    "SPOTIFLAC_REGISTRIES",
+    "https://raw.githubusercontent.com/zarzet/SpotiFLAC-Extension/main/registry.json"
+)
 
 TEMP_DIR = Path("./temp_downloads")
 TEMP_DIR.mkdir(exist_ok=True)
