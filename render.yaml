@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: spotiflac-api
+    env: docker
+    plan: free
+    dockerfilePath: Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: SERVER_URL
+        sync: false
+        # e.g., https://spotiflac-api.onrender.com (optional, for self-ping)
+      - key: QOBUZ_TOKEN
+        sync: false
+      - key: TIDAL_CUSTOM_API
+        sync: false
