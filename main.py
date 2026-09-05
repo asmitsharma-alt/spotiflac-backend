@@ -310,39 +310,50 @@ def _download_worker(url: str, output_dir: str, quality: str, embed_lyrics: bool
     except Exception:
         pass
 
+    # Create and assign an isolated event loop for this background worker thread
+    thread_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(thread_loop)
+
     qobuz_token = os.getenv("QOBUZ_TOKEN") or None
     tidal_api = os.getenv("TIDAL_CUSTOM_API") or None
 
-    # Quality-prioritized provider chain:
-    # 1. Amazon Music: True 24-bit Studio Master Lossless FLAC (~1486 kbps, 34MB)
-    # 2. Qobuz / Tidal: 24-bit / 16-bit Hi-Res Lossless FLAC
-    # 3. Deezer: 16-bit Lossless FLAC
-    # 4. YouTube Music: 48kHz / 258kbps High-Bitrate AAC LC
-    services = ["amazon", "qobuz", "deezer", "youtube"]
+    has_isrc = bool(getattr(meta, "isrc", None))
+    if has_isrc:
+        # Verified ISRC present: Prioritize True 24-bit Studio Master Lossless FLAC
+        services = ["amazon", "qobuz", "deezer", "youtube"]
+    else:
+        # Regional / Bollywood track without Western ISRC: Prioritize YouTube Music for instant <5s extraction
+        services = ["youtube", "amazon", "deezer"]
     if tidal_api:
         services.insert(1, "tidal")
 
-    # 1. Attempt SpotiFLAC multi-service extraction with non-interactive safety
+    # 1. Attempt SpotiFLAC multi-service extraction with direct native thread loop
     import builtins
     original_input = builtins.input
     builtins.input = lambda *a: (_ for _ in ()).throw(EOFError("Non-interactive server execution"))
     try:
-        SpotiFLAC(
-            url=url,
+        from SpotiFLAC.downloader import DownloadOptions, SpotiflacDownloader
+        opts = DownloadOptions(
             output_dir=output_dir,
             services=services,
             quality=quality,
-            embed_lyrics=embed_lyrics,
+            embed_lyrics=False,
             enrich_metadata=False,
             qobuz_token=qobuz_token,
             tidal_custom_api=tidal_api,
             allow_fallback=True,
-            timeout_s=75,
+            timeout_s=35,
         )
+        dl = SpotiflacDownloader(opts)
+        thread_loop.run_until_complete(dl.run_async(url))
     except Exception as e:
-        print(f"[SpotiFLAC] Primary run notice: {e}")
+        print(f"[SpotiflacDownloader] Run notice: {e}")
     finally:
         builtins.input = original_input
+        try:
+            thread_loop.close()
+        except Exception:
+            pass
 
     # Clean up any leftover incomplete part files
     for p in glob.glob(str(Path(output_dir) / "**/*.part"), recursive=True):
