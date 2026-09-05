@@ -4,6 +4,7 @@ import glob
 import shutil
 import asyncio
 from pathlib import Path
+import contextlib
 from contextlib import asynccontextmanager
 import httpx
 from dotenv import load_dotenv
@@ -94,6 +95,60 @@ def cleanup_directory(dir_path: str):
 def health_check():
     """Health check endpoint used by Render and external uptime monitors."""
     return {"status": "ok", "service": "spotiflac-backend", "version": "2.0.0"}
+
+
+@app.get("/api/debug")
+async def debug_info(url: str = Query("https://open.spotify.com/track/5XeFesFbtLpXzIVDNQP22n")):
+    import io
+    import subprocess
+    import traceback
+    
+    buf = io.StringIO()
+    node_out = ""
+    ffmpeg_out = ""
+    exts = []
+    downloaded = []
+    err = None
+
+    try:
+        r = subprocess.run(["node", "-v"], capture_output=True, text=True, timeout=5)
+        node_out = r.stdout.strip()
+    except Exception as e:
+        node_out = f"err: {e}"
+
+    try:
+        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, timeout=5)
+        ffmpeg_out = r.stdout.split("\n")[0] if r.stdout else "none"
+    except Exception as e:
+        ffmpeg_out = f"err: {e}"
+
+    try:
+        from SpotiFLAC.extensions import ExtensionManager
+        em = ExtensionManager()
+        exts = [e.name for e in em.list_installed()]
+    except Exception as e:
+        exts = [f"err: {e}"]
+
+    debug_dir = TEMP_DIR / f"debug_{uuid.uuid4().hex[:8]}"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    
+    with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+        try:
+            await asyncio.to_thread(_download_worker, url, str(debug_dir), "LOSSLESS", False)
+            downloaded = [os.path.basename(f) for f in glob.glob(str(debug_dir / "**/*.*"), recursive=True)]
+        except Exception as e:
+            err = traceback.format_exc()
+        finally:
+            shutil.rmtree(debug_dir, ignore_errors=True)
+
+    return {
+        "node": node_out,
+        "ffmpeg": ffmpeg_out,
+        "installed_extensions": exts,
+        "downloaded_files": downloaded,
+        "error": err,
+        "logs": buf.getvalue(),
+    }
 
 
 @app.get("/api/info")
