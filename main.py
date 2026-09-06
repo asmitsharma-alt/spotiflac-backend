@@ -36,8 +36,53 @@ TEMP_DIR.mkdir(exist_ok=True)
 # Keep-alive task reference
 keep_alive_task = None
 
-# In-memory background jobs registry
+# Persistent background jobs registry
 active_jobs: dict[str, dict] = {}
+JOBS_STATE_FILE = TEMP_DIR / "active_jobs.json"
+
+
+def save_active_jobs():
+    """Atomically persists active job states to disk across container lifecycles."""
+    try:
+        data = {}
+        for k, v in active_jobs.items():
+            data[k] = {
+                "job_id": v.get("job_id"),
+                "status": v.get("status"),
+                "url": v.get("url"),
+                "name": v.get("name"),
+                "cover_url": v.get("cover_url"),
+                "total_tracks": v.get("total_tracks"),
+                "completed_tracks": v.get("completed_tracks"),
+                "failed_tracks": v.get("failed_tracks"),
+                "current_track_title": v.get("current_track_title"),
+                "current_track_index": v.get("current_track_index"),
+                "created_at": v.get("created_at"),
+                "updated_at": v.get("updated_at"),
+                "items": v.get("items", []),
+                "error": v.get("error"),
+                "req_params": v.get("req_params", {}),
+            }
+        tmp_file = TEMP_DIR / "active_jobs.json.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        shutil.move(str(tmp_file), str(JOBS_STATE_FILE))
+    except Exception as e:
+        print(f"[JobsStore] Notice saving jobs: {e}")
+
+
+def load_active_jobs():
+    """Restores job states from disk on server startup."""
+    if not JOBS_STATE_FILE.exists():
+        return
+    try:
+        with open(JOBS_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict):
+                active_jobs.update(data)
+                print(f"[JobsStore] Restored {len(data)} job state(s) from persistent disk.")
+    except Exception as e:
+        print(f"[JobsStore] Notice loading jobs: {e}")
 
 
 async def run_keep_alive(url: str, interval_minutes: int = 14):
@@ -69,6 +114,39 @@ async def lifespan(app: FastAPI):
         print(f"[Extensions] Active extensions: {[e.name for e in em.list_installed()]}")
     except Exception as e:
         print(f"[Extensions] Setup notice: {e}")
+
+    # Restore persisted jobs from disk
+    load_active_jobs()
+
+    # Automatically restart and resume any unfinished jobs
+    for jid, jdata in list(active_jobs.items()):
+        if jdata.get("status") in ("in_progress", "queued"):
+            params = jdata.get("req_params", {})
+            if params.get("access_token") and params.get("url"):
+                print(f"[AutoResume] Resuming interrupted task {jid[:8]} ('{jdata.get('name')}') from Google Drive...")
+
+                async def _resume_task(j_id=jid, p=params, jd=jdata):
+                    try:
+                        _, trs, _, _ = await metadata_client.get_url_async(p["url"])
+                        if trs:
+                            is_col = len(trs) > 1 or ("/album/" in p["url"]) or ("/playlist/" in p["url"])
+                            sub = jd.get("name") if is_col else None
+                            await run_drive_job(
+                                job_id=j_id,
+                                tracks=trs,
+                                quality=p.get("quality", "LOSSLESS"),
+                                embed_lyrics=p.get("embed_lyrics", True),
+                                access_token=p["access_token"],
+                                base_folder_name=p.get("folder_name") or "SpotiFLAC",
+                                subfolder_name=sub,
+                            )
+                    except Exception as err:
+                        print(f"[AutoResume] Error resuming {j_id[:8]}: {err}")
+                        jd["status"] = "failed"
+                        jd["error"] = f"Task was interrupted: {err}"
+                        save_active_jobs()
+
+                asyncio.create_task(_resume_task())
 
     external_url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("SERVER_URL")
     if external_url:
@@ -1334,21 +1412,32 @@ def match_drive_file_to_track(file_info: dict, tr) -> bool:
         return False
 
     clean_f = re.sub(r'[^a-z0-9]', '', os.path.splitext(fname)[0])
-    clean_title = re.sub(r'[^a-z0-9]', '', (tr.title or "").lower())
-    first_artist = (tr.artists.split(',')[0] if tr.artists else "").strip()
+    title = (tr.title or "").strip()
+    artists = (tr.artists or "").strip()
+    clean_title = re.sub(r'[^a-z0-9]', '', title.lower())
+    base_title = re.sub(r'[^a-z0-9]', '', re.sub(r'\(.*?\)|\[.*?\]', '', title).lower())
+    first_artist = (artists.split(',')[0] if artists else '').strip()
     clean_artist = re.sub(r'[^a-z0-9]', '', first_artist.lower())
 
-    # 1. Exact or near match of "title + artists"
-    expected = re.sub(r'[^a-z0-9]', '', f"{tr.title} {tr.artists}".lower())
-    if clean_f == expected or expected in clean_f or clean_f in expected:
+    # 1. Exact or near match of "title + artists" or "artists + title"
+    comb1 = re.sub(r'[^a-z0-9]', '', f"{title} {artists}".lower())
+    comb2 = re.sub(r'[^a-z0-9]', '', f"{artists} {title}".lower())
+    if comb1 in clean_f or comb2 in clean_f or clean_f in comb1 or clean_f in comb2:
         return True
 
-    # 2. Contains track title and primary artist
-    if clean_title and clean_title in clean_f:
+    # 2. Track prefix stripped (e.g. "01 - Title.flac" or "01 Title.flac")
+    clean_f_notrack = re.sub(r'^\d+', '', clean_f)
+    if clean_title and (clean_title == clean_f_notrack or clean_title in clean_f):
+        if not clean_artist or clean_artist in clean_f or len(clean_title) >= 5:
+            return True
+
+    # 3. Base title match without parenthetical remarks
+    if base_title and len(base_title) >= 4 and base_title in clean_f:
         if not clean_artist or clean_artist in clean_f:
             return True
 
     return False
+
 
 
 async def upload_file_to_drive(client: httpx.AsyncClient, access_token: str, file_path: str, filename: str, mime_type: str, folder_id: str) -> dict:
@@ -1593,81 +1682,101 @@ async def run_drive_job(
                     job["current_track_title"] = f"{track_title} - {track_artists}"
                     job["current_track_index"] = idx + 1
                     job["updated_at"] = time.time()
+                    save_active_jobs()
 
-                track_dir = TEMP_DIR / f"{job_id}_{idx}"
-                track_dir.mkdir(parents=True, exist_ok=True)
+                max_retries = 2
+                uploaded = False
+                last_error = None
 
-                try:
-                    print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Processing (parallel): {track_title}...")
-                    await asyncio.to_thread(
-                        _download_worker,
-                        track_url,
-                        str(track_dir),
-                        quality,
-                        embed_lyrics,
-                        meta=tr
-                    )
+                for attempt in range(max_retries + 1):
+                    track_dir = TEMP_DIR / f"{job_id}_{idx}"
+                    track_dir.mkdir(parents=True, exist_ok=True)
 
-                    downloaded_files = glob.glob(str(track_dir / "**/*.*"), recursive=True)
-                    audio_files = [
-                        f for f in downloaded_files
-                        if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
-                    ]
+                    try:
+                        if attempt > 0:
+                            print(f"[DriveJob {job_id[:8]}] [Auto-Retry {attempt}/{max_retries}] {track_title}...")
+                        else:
+                            print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Processing: {track_title}...")
 
-                    if not audio_files:
-                        raise Exception("Audio stream could not be extracted from providers.")
+                        await asyncio.to_thread(
+                            _download_worker,
+                            track_url,
+                            str(track_dir),
+                            quality,
+                            embed_lyrics,
+                            meta=tr
+                        )
 
-                    file_path = audio_files[0]
-                    filename = os.path.basename(file_path)
-                    ext = os.path.splitext(filename)[1].lower()
-                    media_types = {
-                        ".flac": "audio/flac",
-                        ".mp3": "audio/mpeg",
-                        ".m4a": "audio/mp4",
-                        ".wav": "audio/wav",
-                        ".ogg": "audio/ogg",
-                        ".opus": "audio/opus",
-                    }
-                    mime_type = media_types.get(ext, "application/octet-stream")
+                        downloaded_files = glob.glob(str(track_dir / "**/*.*"), recursive=True)
+                        audio_files = [
+                            f for f in downloaded_files
+                            if f.lower().endswith(('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus'))
+                        ]
 
-                    drive_file = await upload_file_to_drive(
-                        client,
-                        access_token,
-                        file_path,
-                        filename,
-                        mime_type,
-                        target_folder_id
-                    )
+                        if not audio_files:
+                            raise Exception("Audio stream could not be extracted from providers.")
 
-                    file_id = drive_file.get("id")
-                    web_link = drive_file.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+                        file_path = audio_files[0]
+                        filename = os.path.basename(file_path)
+                        ext = os.path.splitext(filename)[1].lower()
+                        media_types = {
+                            ".flac": "audio/flac",
+                            ".mp3": "audio/mpeg",
+                            ".m4a": "audio/mp4",
+                            ".wav": "audio/wav",
+                            ".ogg": "audio/ogg",
+                            ".opus": "audio/opus",
+                        }
+                        mime_type = media_types.get(ext, "application/octet-stream")
 
-                    async with job_lock:
-                        job["items"].append({
-                            "title": track_title,
-                            "artists": track_artists,
-                            "status": "completed",
-                            "file_name": filename,
-                            "file_id": file_id,
-                            "web_view_link": web_link,
-                            "size": drive_file.get("size"),
-                        })
-                        job["completed_tracks"] += 1
-                        job["updated_at"] = time.time()
-                    print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Uploaded to Drive: {filename}")
-                except Exception as item_err:
-                    print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Error: {item_err}")
+                        drive_file = await upload_file_to_drive(
+                            client,
+                            access_token,
+                            file_path,
+                            filename,
+                            mime_type,
+                            target_folder_id
+                        )
+
+                        file_id = drive_file.get("id")
+                        web_link = drive_file.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+
+                        async with job_lock:
+                            job["items"].append({
+                                "title": track_title,
+                                "artists": track_artists,
+                                "status": "completed",
+                                "file_name": filename,
+                                "file_id": file_id,
+                                "web_view_link": web_link,
+                                "size": drive_file.get("size"),
+                            })
+                            job["completed_tracks"] += 1
+                            job["updated_at"] = time.time()
+                            save_active_jobs()
+
+                        print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Uploaded to Drive: {filename}")
+                        uploaded = True
+                        break
+                    except Exception as item_err:
+                        last_error = item_err
+                        print(f"[DriveJob {job_id[:8]}] [{idx+1}/{len(tracks)}] Notice (attempt {attempt+1}): {item_err}")
+                        if attempt < max_retries:
+                            await asyncio.sleep(2.0)
+                    finally:
+                        cleanup_directory(str(track_dir))
+
+                if not uploaded:
                     async with job_lock:
                         job["items"].append({
                             "title": track_title,
                             "artists": track_artists,
                             "status": "failed",
-                            "error": str(item_err),
+                            "error": str(last_error),
                         })
                         job["failed_tracks"] += 1
                         job["updated_at"] = time.time()
-                finally:
-                    cleanup_directory(str(track_dir))
+                        save_active_jobs()
 
         # Run track processing in parallel only for the remaining missing tracks
         tasks = [process_track(idx, tr) for idx, tr in pending_tracks]
@@ -1679,6 +1788,7 @@ async def run_drive_job(
         job["status"] = "failed"
         job["error"] = "No tracks could be downloaded and uploaded."
     job["updated_at"] = time.time()
+    save_active_jobs()
     print(f"[DriveJob {job_id[:8]}] Finished: {job['completed_tracks']} succeeded, {job['failed_tracks']} failed.")
 
 
@@ -1726,7 +1836,15 @@ async def create_drive_job(req: SaveToDriveRequest):
         "updated_at": time.time(),
         "items": [],
         "error": None,
+        "req_params": {
+            "url": req.url,
+            "quality": req.quality,
+            "embed_lyrics": req.embed_lyrics,
+            "access_token": req.access_token,
+            "folder_name": req.folder_name or "SpotiFLAC",
+        },
     }
+    save_active_jobs()
 
     # Start detached background task on server
     asyncio.create_task(
