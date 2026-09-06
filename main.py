@@ -1273,6 +1273,84 @@ async def get_or_create_drive_folder(
     )
 
 
+async def list_files_in_drive_folder(
+    client: httpx.AsyncClient,
+    access_token: str,
+    folder_id: str
+) -> list[dict]:
+    """
+    Retrieves all non-trashed audio files currently present inside a Google Drive folder.
+    Used to implement autonomous job resuming across interruptions.
+    """
+    headers = {"Authorization": f"Bearer {access_token}"}
+    query = f"'{folder_id}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'"
+    files = []
+    page_token = None
+
+    while True:
+        params = {
+            "q": query,
+            "spaces": "drive",
+            "fields": "nextPageToken, files(id, name, size, webViewLink)",
+            "pageSize": 1000,
+        }
+        if page_token:
+            params["pageToken"] = page_token
+
+        try:
+            res = await client.get(
+                "https://www.googleapis.com/drive/v3/files",
+                headers=headers,
+                params=params,
+                timeout=20.0
+            )
+            if res.status_code == 200:
+                data = res.json()
+                files.extend(data.get("files", []))
+                page_token = data.get("nextPageToken")
+                if not page_token:
+                    break
+            else:
+                print(f"[GDrive] List files notice ({res.status_code}): {res.text}")
+                break
+        except Exception as e:
+            print(f"[GDrive] List files error: {e}")
+            break
+
+    return files
+
+
+def match_drive_file_to_track(file_info: dict, tr) -> bool:
+    """
+    Intelligently matches an existing Drive file to a Spotify track to support seamless resuming.
+    Ensures minimum size of 100KB so incomplete/aborted 0-byte uploads are not treated as valid.
+    """
+    fname = (file_info.get("name") or "").lower()
+    fsize = int(file_info.get("size") or 0)
+    if fsize < 100000:
+        return False
+
+    if not any(fname.endswith(ext) for ext in ('.flac', '.mp3', '.m4a', '.wav', '.ogg', '.opus')):
+        return False
+
+    clean_f = re.sub(r'[^a-z0-9]', '', os.path.splitext(fname)[0])
+    clean_title = re.sub(r'[^a-z0-9]', '', (tr.title or "").lower())
+    first_artist = (tr.artists.split(',')[0] if tr.artists else "").strip()
+    clean_artist = re.sub(r'[^a-z0-9]', '', first_artist.lower())
+
+    # 1. Exact or near match of "title + artists"
+    expected = re.sub(r'[^a-z0-9]', '', f"{tr.title} {tr.artists}".lower())
+    if clean_f == expected or expected in clean_f or clean_f in expected:
+        return True
+
+    # 2. Contains track title and primary artist
+    if clean_title and clean_title in clean_f:
+        if not clean_artist or clean_artist in clean_f:
+            return True
+
+    return False
+
+
 async def upload_file_to_drive(client: httpx.AsyncClient, access_token: str, file_path: str, filename: str, mime_type: str, folder_id: str) -> dict:
     """Uploads a local audio file directly into Google Drive via multipart upload."""
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -1451,6 +1529,57 @@ async def run_drive_job(
             print(f"[DriveJob {job_id[:8]}] Folder init failed: {fe}")
             return
 
+        # Fetch existing files in target Google Drive folder to support seamless RESUMING
+        try:
+            existing_drive_files = await list_files_in_drive_folder(client, access_token, target_folder_id)
+            print(f"[DriveJob {job_id[:8]}] Found {len(existing_drive_files)} existing file(s) in Drive folder.")
+        except Exception as e:
+            print(f"[DriveJob {job_id[:8]}] Resume inspection notice: {e}")
+            existing_drive_files = []
+
+        pending_tracks = []
+        already_resumed_count = 0
+
+        for idx, tr in enumerate(tracks):
+            matched_file = None
+            for ef in existing_drive_files:
+                if match_drive_file_to_track(ef, tr):
+                    matched_file = ef
+                    break
+
+            if matched_file:
+                file_id = matched_file["id"]
+                web_link = matched_file.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"
+                job["items"].append({
+                    "title": tr.title,
+                    "artists": tr.artists,
+                    "status": "completed",
+                    "file_name": matched_file.get("name"),
+                    "file_id": file_id,
+                    "web_view_link": web_link,
+                    "size": matched_file.get("size"),
+                    "resumed": True,
+                })
+                job["completed_tracks"] += 1
+                already_resumed_count += 1
+            else:
+                pending_tracks.append((idx, tr))
+
+        job["updated_at"] = time.time()
+
+        if already_resumed_count > 0:
+            print(f"[DriveJob {job_id[:8]}] Resuming job: {already_resumed_count}/{len(tracks)} track(s) already verified in Google Drive! Remaining to download: {len(pending_tracks)}.")
+
+        # If all tracks were already present in Google Drive, finish immediately!
+        if len(pending_tracks) == 0:
+            job["status"] = "completed"
+            job["current_track_title"] = f"All {len(tracks)} track(s) verified in Google Drive!"
+            job["updated_at"] = time.time()
+            print(f"[DriveJob {job_id[:8]}] All tracks already exist in Drive folder! Job marked complete immediately.")
+            return
+
+        job["current_track_title"] = f"Resuming: {already_resumed_count} already in Drive, downloading remaining {len(pending_tracks)}..."
+
         sem = asyncio.Semaphore(2)
         job_lock = asyncio.Lock()
 
@@ -1540,8 +1669,8 @@ async def run_drive_job(
                 finally:
                     cleanup_directory(str(track_dir))
 
-        # Run track processing in parallel with bounded concurrency (3 concurrent workers)
-        tasks = [process_track(idx, tr) for idx, tr in enumerate(tracks)]
+        # Run track processing in parallel only for the remaining missing tracks
+        tasks = [process_track(idx, tr) for idx, tr in pending_tracks]
         await asyncio.gather(*tasks, return_exceptions=True)
 
     if job["completed_tracks"] > 0:
