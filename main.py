@@ -465,15 +465,24 @@ def score_candidate(
         if coverage < 0.65:
             return -500.0, f"Disqualified: low title word coverage ({coverage:.2f})"
 
-    # Primary artist match (must appear in candidate title or uploader/channel)
-    primary_artist = re.split(r'[,&/]', exp_artist_lower)[0].strip()
-    artist_words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', primary_artist) if len(w) > 2]
-    artist_found = (primary_artist in title_lower or primary_artist in uploader_lower)
-    if not artist_found and artist_words:
-        artist_found = all(w in title_lower or w in uploader_lower for w in artist_words)
+    # Artist match: check if ANY artist listed on the track appears in title or uploader
+    all_artists = [a.strip().lower() for a in re.split(r'[,&/]', exp_artist_lower) if a.strip()]
+    artist_found = False
+    for a in all_artists:
+        if a in title_lower or a in uploader_lower:
+            artist_found = True
+            break
+        a_words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', a) if len(w) > 2]
+        if a_words and any(w in title_lower or w in uploader_lower for w in a_words):
+            artist_found = True
+            break
+
+    # If title is an exact match and long enough, allow label/studio uploaders (T-Series, Zee, etc.)
+    if not artist_found and clean_exp_title in title_lower and len(clean_exp_title) >= 5:
+        artist_found = True
 
     if not artist_found:
-        return -400.0, "Disqualified: primary artist missing from title and uploader"
+        return -400.0, "Disqualified: artist missing from title and uploader"
 
     # Duration validation
     diff = 0.0
@@ -561,11 +570,23 @@ def score_saavn_candidate(
         if len(matched) / len(words) < 0.65:
             return -500.0
 
-    # Primary artist match (CRITICAL: artist MUST appear in cand_artist, NOT just candidate title)
-    artist_words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', a_exp) if len(w) > 2]
-    artist_found = (a_exp in a_cand)
-    if not artist_found and artist_words:
-        artist_found = all(w in a_cand for w in artist_words)
+    # Artist match: check if ANY artist on the track appears in candidate artist or title
+    all_artists = [a.strip().lower() for a in re.split(r'[,&/]', (exp_artist or "").lower()) if a.strip()]
+    artist_found = False
+    for a in all_artists:
+        if a in a_cand or a in t_cand:
+            artist_found = True
+            break
+        a_words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', a) if len(w) > 2]
+        if a_words and any(w in a_cand or w in t_cand for w in a_words):
+            artist_found = True
+            break
+
+    # If title is an exact match and long enough, allow match even if artist differs slightly
+    clean_cand_t = re.sub(r'[^a-z0-9]', '', t_cand)
+    clean_exp_t = re.sub(r'[^a-z0-9]', '', t_exp)
+    if not artist_found and clean_cand_t == clean_exp_t and len(clean_exp_t) >= 5:
+        artist_found = True
 
     if not artist_found:
         return -400.0
